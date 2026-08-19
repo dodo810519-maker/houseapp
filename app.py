@@ -1,11 +1,13 @@
 import html
 import os
 import re
+import threading
 import urllib.parse
 
 import streamlit as st
 import streamlit.components.v1 as components
 
+import plvr
 from scraper import AnalysisReport, analyze_url
 
 try:
@@ -148,6 +150,28 @@ if "single_report" not in st.session_state:
     st.session_state.single_report = None
 if "compare_reports" not in st.session_state:
     st.session_state.compare_reports = None
+
+
+@st.cache_resource(show_spinner=False)
+def _start_plvr_warmup() -> bool:
+    """伺服器啟動後在背景預載六都實價登錄，縮短首次分析等待時間。"""
+
+    def _run() -> None:
+        try:
+            plvr.warm_common_cities(season_count=2)
+        except Exception:
+            pass
+
+    threading.Thread(target=_run, daemon=True).start()
+    return True
+
+
+_start_plvr_warmup()
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def cached_analyze_url(url: str) -> AnalysisReport:
+    return analyze_url(url)
 
 
 def clear_single_url() -> None:
@@ -408,7 +432,7 @@ with st.container():
         with c_input:
             st.text_input(
                 "房屋網址",
-                placeholder="591、樂屋、信義、永慶、住商、台灣房屋、好房網、東森…",
+                placeholder="591、樂屋、信義、永慶、住商、台灣房屋、好房網、東森、中信…",
                 key="single_url",
                 label_visibility="collapsed",
             )
@@ -424,7 +448,7 @@ with st.container():
             st.button("🗑 清空全部", on_click=clear_compare_urls, use_container_width=True)
         st.text_area(
             "多個房屋網址",
-            placeholder="每行一個網址：591、樂屋、信義、永慶、住商、台灣房屋、好房網、東森…",
+            placeholder="每行一個網址：591、樂屋、信義、永慶、住商、台灣房屋、好房網、東森、中信…",
             height=90,
             key="compare_urls",
             label_visibility="collapsed",
@@ -437,14 +461,18 @@ if mode == "單一分析" and run_single:
         st.warning("請先貼上房屋網址。")
         st.session_state.single_report = None
     else:
-        with st.spinner("正在分析，請稍候…"):
+        with st.status("正在分析…", expanded=True) as status:
+            status.write("讀取物件資料…")
             try:
-                st.session_state.single_report = analyze_url(url)
+                st.session_state.single_report = cached_analyze_url(url)
                 st.session_state.compare_reports = None
+                status.update(label="分析完成", state="complete")
             except ValueError as exc:
+                status.update(label="分析失敗", state="error")
                 st.error(str(exc))
                 st.session_state.single_report = None
             except Exception:
+                status.update(label="分析失敗", state="error")
                 st.error("讀取失敗，請確認網址是否正確。")
                 st.session_state.single_report = None
 
@@ -461,9 +489,9 @@ elif mode == "多物件比較" and run_compare:
         errors: list[str] = []
         progress = st.progress(0, text="準備中…")
         for idx, url in enumerate(urls):
-            progress.progress(idx / len(urls), text=f"分析第 {idx + 1} / {len(urls)} 間…")
+            progress.progress((idx + 0.2) / len(urls), text=f"分析第 {idx + 1} / {len(urls)} 間…")
             try:
-                reports.append(analyze_url(url))
+                reports.append(cached_analyze_url(url))
             except ValueError as exc:
                 errors.append(f"第 {idx + 1} 間：{exc}")
             except Exception:
@@ -485,6 +513,7 @@ elif mode == "多物件比較" and run_compare:
 
 if mode == "單一分析" and st.session_state.single_report:
     render_report(st.session_state.single_report)
+    st.caption("若網站閒置一段時間後首次開啟較慢，是雲端喚醒所致；實價登錄會在背景預載，第二次起會快很多。")
 
 elif mode == "多物件比較" and st.session_state.compare_reports:
     reports = st.session_state.compare_reports

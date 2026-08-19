@@ -12,12 +12,14 @@ import ssl
 import statistics
 import urllib.request
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 from typing import Optional
 
 CACHE_DIR = Path(__file__).with_name("plvr_cache")
+COMMON_WARM_CITIES = ("台北市", "新北市", "桃園市", "台中市", "高雄市", "台南市")
 SQM_PER_PING = 3.305785
 DOWNLOAD_URL = "https://plvr.land.moi.gov.tw/DownloadSeason?season={season}&fileName=lvr_landcsv.zip"
 
@@ -145,26 +147,69 @@ def _cache_path(season: str, city_code: str) -> Path:
     return CACHE_DIR / f"{season}_{city_code}.csv"
 
 
-def fetch_season_csv(season: str, city_code: str, timeout: int = 120) -> str:
-    """下載該季全國 zip，只留下需要的縣市 CSV 存進快取。"""
-    path = _cache_path(season, city_code)
+def _season_zip_path(season: str) -> Path:
+    return CACHE_DIR / f"{season}_all.zip"
+
+
+def _download_season_zip(season: str, timeout: int = 120) -> bytes:
+    """下載並快取該季全國 zip，同季多縣市共用，避免重複下載。"""
+    path = _season_zip_path(season)
     if path.exists():
-        return path.read_text(encoding="utf-8", errors="ignore")
+        return path.read_bytes()
 
     url = DOWNLOAD_URL.format(season=season)
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (houseapp)"})
     with urllib.request.urlopen(req, timeout=timeout, context=_ssl_context()) as response:
         raw = response.read()
 
+    CACHE_DIR.mkdir(exist_ok=True)
+    path.write_bytes(raw)
+    return raw
+
+
+def _extract_city_csv(season: str, city_code: str, raw: bytes) -> str:
     with zipfile.ZipFile(io.BytesIO(raw)) as archive:
         name = f"{city_code}_lvr_land_a.csv"
         if name not in archive.namelist():
             raise FileNotFoundError(f"{season} 找不到 {name}")
-        text = archive.read(name).decode("utf-8", "ignore")
+        return archive.read(name).decode("utf-8", "ignore")
+
+
+def fetch_season_csv(season: str, city_code: str, timeout: int = 120) -> str:
+    """下載該季全國 zip，只留下需要的縣市 CSV 存進快取。"""
+    path = _cache_path(season, city_code)
+    if path.exists():
+        return path.read_text(encoding="utf-8", errors="ignore")
+
+    raw = _download_season_zip(season, timeout=timeout)
+    text = _extract_city_csv(season, city_code, raw)
 
     CACHE_DIR.mkdir(exist_ok=True)
     path.write_text(text, encoding="utf-8")
     return text
+
+
+def warm_common_cities(season_count: int = 2) -> dict[str, str]:
+    """預載六都最近幾季實價登錄，雲端首次分析會快很多。"""
+    status: dict[str, str] = {}
+    for season in recent_seasons(season_count):
+        try:
+            raw = _download_season_zip(season)
+        except Exception as exc:
+            status[f"season:{season}"] = f"失敗：{exc}"
+            continue
+        for city in COMMON_WARM_CITIES:
+            code = CITY_FILE_CODES.get(normalize_address(city))
+            if not code:
+                continue
+            try:
+                text = _extract_city_csv(season, code, raw)
+                CACHE_DIR.mkdir(exist_ok=True)
+                _cache_path(season, code).write_text(text, encoding="utf-8")
+                status[city] = "ready"
+            except Exception as exc:
+                status[city] = f"部分失敗：{exc}"
+    return status
 
 
 def parse_season_csv(text: str, season: str) -> list[LandDeal]:
@@ -226,13 +271,25 @@ def load_city_deals(city: str, seasons: Optional[list[str]] = None) -> tuple[lis
 
     deals: list[LandDeal] = []
     loaded: list[str] = []
-    for season in seasons:
+
+    def _load_season(season: str) -> tuple[str, list[LandDeal]] | None:
         try:
             text = fetch_season_csv(season, city_code)
         except Exception:
-            continue
-        deals.extend(parse_season_csv(text, season))
-        loaded.append(season)
+            return None
+        return season, parse_season_csv(text, season)
+
+    workers = min(3, len(seasons))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(_load_season, season) for season in seasons]
+        for future in as_completed(futures):
+            result = future.result()
+            if not result:
+                continue
+            season, season_deals = result
+            deals.extend(season_deals)
+            loaded.append(season)
+    loaded.sort(key=lambda s: seasons.index(s) if s in seasons else 999)
 
     _MEMORY_CACHE[key] = (deals, loaded)
     return deals, loaded

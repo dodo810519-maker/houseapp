@@ -10,12 +10,14 @@ from scraper import (
     _community_name_from_listing,
     _deal_newer_than_official,
     _format_registered_area,
+    _parse_cthouse_id,
     _parse_591_id,
     _parse_parking_info,
     _pick_leju_candidate,
     _plvr_parking_keywords,
     _price_to_wan,
     merge_community_fields,
+    parse_cthouse_listing,
     parse_etwarm_html,
     parse_hbhousing_html,
     parse_housefun_html,
@@ -343,6 +345,45 @@ class PortalParseTests(unittest.TestCase):
         self.assertEqual(listing.house_age, "34.6年")
         self.assertEqual(listing.parking_desc, "無車位")
         self.assertIn("43.4", listing.registered)
+
+
+class CthouseParseTests(unittest.TestCase):
+    def test_cthouse_id_from_url(self):
+        self.assertEqual(_parse_cthouse_id("https://buy.cthouse.com.tw/house/1083GN-sell.html"), "1083GN")
+        self.assertEqual(_parse_cthouse_id("https://buy.cthouse.com.tw/house/2097113.html"), "2097113")
+
+    def test_cthouse_listing_fields(self):
+        data = {
+            "case_name": "大毅好幸福三房平車露台戶",
+            "sell_price": "1740",
+            "unit_price": 32.57,
+            "house_area": 53.43,
+            "main_build": 25.75,
+            "age_val": "9年",
+            "floor_val": "3樓/共15樓",
+            "r_type": "3房2廳2衛",
+            "address": "臺中市太平區立文街",
+            "postulate_ratio": 32.492,
+            "month_fee": 4.62,
+            "parking_lot_belong": 1,
+            "parking_lot_price": 0.0,
+            "latitude": 24.159,
+            "longitude": 120.716,
+            "direction": "座北朝南",
+            "object_tag": [["1", "大毅好幸福", "/community/20190716215002380.html"]],
+            "s_imgs": ["https://media.cthouse.com.tw/photo/project2/house_photo/202603/2097113-1s_new.jpg"],
+        }
+        listing = parse_cthouse_listing(
+            data,
+            "https://buy.cthouse.com.tw/house/1083GN-sell.html",
+            "1083GN",
+        )
+        self.assertEqual(listing.listing_id, "1083GN")
+        self.assertEqual(listing.ask_price_wan, 1740)
+        self.assertEqual(listing.community_name, "大毅好幸福")
+        self.assertEqual(listing.floor, "3樓/共15樓")
+        self.assertIn("含在售價內", listing.parking_desc)
+        self.assertTrue(listing.images[0].endswith("_new.jpg"))
 
 
 class CommunityMatchTests(unittest.TestCase):

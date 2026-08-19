@@ -2839,6 +2839,149 @@ def parse_etwarm_html(html: str, url: str) -> PortalListing:
     return listing
 
 
+CTHOUSE_LIST_API = "https://buy.cthouse.com.tw/api/house_list.ashx"
+
+
+def _fetch_cthouse_json(arg: str) -> dict:
+    payload = json.dumps({"arg": arg, "page": 1}).encode("utf-8")
+    req = urllib.request.Request(
+        CTHOUSE_LIST_API,
+        data=payload,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+            ),
+            "Content-Type": "application/json;charset=UTF-8",
+            "Accept": "application/json, text/plain, */*",
+            "Referer": "https://buy.cthouse.com.tw/",
+            "Origin": "https://buy.cthouse.com.tw",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=25, context=_ssl_context()) as response:
+        data = json.loads(response.read().decode("utf-8", "ignore"))
+    houses = data.get("houses") or []
+    if not houses:
+        raise ValueError("中信房屋物件資料讀取失敗，請確認網址或物件編號是否仍有效。")
+    return houses[0]
+
+
+def _parse_cthouse_id(url: str) -> str:
+    parsed = urlparse(url)
+    path = parsed.path.strip("/")
+    match = re.search(
+        r"(?:^house/)?(?:(\d+[A-Za-z]{1,4})|(\d+))(?:-sell)?(?:\.html)?/?$",
+        path,
+        re.I,
+    )
+    if match:
+        return match.group(1) or match.group(2) or ""
+    query = urllib.parse.parse_qs(parsed.query)
+    for key in ("arg", "id", "house_id", "sn"):
+        if query.get(key, [""])[0]:
+            return query[key][0]
+    bare = (url or "").strip()
+    if re.fullmatch(r"\d+[A-Za-z]{1,4}", bare):
+        return bare
+    if bare.isdigit():
+        return bare
+    return ""
+
+
+def _cthouse_image_urls(data: dict) -> list[str]:
+    urls = []
+    for item in data.get("s_imgs") or []:
+        url = str(item).replace("s_new", "_new")
+        urls.append(url)
+    if urls:
+        return _unique_urls(urls)
+    for item in data.get("imgs") or []:
+        path = str(item)
+        if path.startswith("/"):
+            urls.append(f"https://media.cthouse.com.tw/photo{path}")
+        elif path.startswith("http"):
+            urls.append(path)
+    return _unique_urls(urls)
+
+
+def _set_cthouse_parking(listing: PortalListing, data: dict) -> None:
+    title = listing.title or ""
+    belong = data.get("parking_lot_belong")
+    has_hint = belong not in (0, "0", None, "") or any(k in title for k in ("車位", "平車", "機械", "坡道"))
+    if not has_hint:
+        listing.parking_desc = "無車位"
+        listing.parking_unknown = False
+        return
+
+    parts = []
+    if "機械" in title:
+        parts.append("機械式")
+    elif "平車" in title or "平面" in title:
+        parts.append("平面式")
+    elif "坡道" in title:
+        parts.append("坡道式")
+
+    parking_price = _to_float(data.get("parking_lot_price"))
+    if parking_price and parking_price > 0:
+        listing.parking_desc = f"{'、'.join(parts) or '有車位'}（車位價 {parking_price:.0f} 萬）"
+    elif parts or "含車" in title or "平車" in title:
+        listing.parking_desc = f"{'、'.join(parts) or '有'}，已含在售價內"
+    else:
+        listing.parking_desc = "有車位"
+    listing.parking_unknown = False
+
+
+def parse_cthouse_listing(data: dict, url: str, listing_id: str) -> PortalListing:
+    listing = PortalListing(source_name="中信房屋", listing_id=listing_id, source_url=url)
+    listing.title = _clean(data.get("case_name") or "")
+    listing.ask_price_wan = _price_to_wan(data.get("sell_price"))
+    if data.get("unit_price"):
+        listing.ask_unit_price = f"{data['unit_price']}萬/坪"
+    if data.get("house_area"):
+        listing.registered = f"{data['house_area']}坪"
+    if data.get("main_build"):
+        listing.main_area = f"{data['main_build']}坪"
+    if data.get("age_val"):
+        listing.house_age = str(data["age_val"])
+    elif data.get("age") not in (None, ""):
+        listing.house_age = f"{data['age']}年"
+    listing.floor = _clean(data.get("floor_val") or "")
+    listing.layout = _clean(data.get("r_type") or data.get("type_val") or "")
+    if not listing.layout and data.get("room") not in (None, ""):
+        listing.layout = f"{data['room']}房{data.get('hall') or 0}廳{data.get('bath') or 0}衛"
+    listing.listing_address = plvr.normalize_address(data.get("address") or "")
+    if data.get("postulate_ratio"):
+        listing.public_ratio = f"{float(data['postulate_ratio']):.2f}%"
+    if data.get("month_fee"):
+        listing.management_fee = f"{round(float(data['month_fee']))}元/坪"
+    for tag in data.get("object_tag") or []:
+        if isinstance(tag, (list, tuple)) and tag and str(tag[0]) == "1" and len(tag) > 1:
+            community = _clean(str(tag[1]))
+            if _looks_like_community_name(community):
+                listing.community_name = community
+            break
+    _set_cthouse_parking(listing, data)
+    listing.lat = _to_float(data.get("latitude"))
+    listing.lon = _to_float(data.get("longitude"))
+    direction = _clean(data.get("direction") or "")
+    listing.remark = " ".join(part for part in (listing.title, direction) if part)
+    listing.images = _cthouse_image_urls(data)
+    return listing
+
+
+def analyze_cthouse(url: str) -> AnalysisReport:
+    listing_id = _parse_cthouse_id(url)
+    if not listing_id:
+        raise ValueError("這不是有效的中信房屋物件網址。")
+    data = _fetch_cthouse_json(listing_id)
+    page_url = url if url.startswith("http") else f"https://buy.cthouse.com.tw/house/{listing_id}-sell.html"
+    listing = parse_cthouse_listing(data, page_url, listing_id)
+    if not listing.title and not listing.registered:
+        raise ValueError("中信房屋物件資料讀取失敗，請確認網址是否仍有效。")
+    return analyze_portal_listing(listing)
+
+
 def analyze_hbhousing(url: str) -> AnalysisReport:
     match = re.search(r"[?&]sn=([A-Za-z0-9]+)", url) or re.search(r"/detail/([A-Za-z0-9]+)", url)
     if not match:
@@ -3055,7 +3198,9 @@ def analyze_url(url: str) -> AnalysisReport:
         return analyze_housefun(text)
     if "etwarm.com.tw" in host:
         return analyze_etwarm(text)
+    if "cthouse.com.tw" in host:
+        return analyze_cthouse(text)
     raise ValueError(
-        "請貼上房屋物件網址：591、樂屋、信義、永慶、住商、台灣房屋、好房網或東森。"
+        "請貼上房屋物件網址：591、樂屋、信義、永慶、住商、台灣房屋、好房網、東森或中信。"
         "591 也可以只貼物件編號。樂居社區頁也可以，但沒有單一戶的開價與權狀。"
     )
