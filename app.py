@@ -188,6 +188,48 @@ def _render_price_gap(report: AnalysisReport) -> None:
         cols[2].metric("較前次成交", f"{ask - before:+,.0f} 萬", delta=f"{(ask / before - 1) * 100:+.1f}%")
 
 
+def _render_building_deals(report: AnalysisReport) -> None:
+    """列出同棟的實價登錄明細，讓使用者能自己核對估價依據。"""
+    deals = getattr(report, "building_deals", None)
+    if not deals:
+        return
+
+    scope = getattr(report, "building_deal_scope", "") or "同棟"
+    with st.expander(f"同棟實價登錄明細（{len(deals)} 筆，比對方式：{scope}）"):
+        table = {
+            "成交年月": [d.date for d in deals],
+            "門牌": [d.address for d in deals],
+            "樓層": [d.floor or "—" for d in deals],
+            "格局": [d.layout or "—" for d in deals],
+            "權狀坪": [f"{d.total_ping:.2f}" for d in deals],
+            "車位坪": [f"{d.parking_ping:.2f}" if d.parking_ping else "—" for d in deals],
+            "總價(萬)": [f"{d.total_wan:,.0f}" for d in deals],
+            "車位價(萬)": [f"{d.parking_wan:,.0f}" if d.parking_wan else "—" for d in deals],
+            "房屋單價": [f"{d.house_unit_price:.1f}" if d.house_unit_price else "無法拆分" for d in deals],
+            "備註": [d.note.rstrip("；") or "—" for d in deals],
+        }
+        st.dataframe(table, use_container_width=True, hide_index=True)
+        st.caption("房屋單價為扣除車位後的萬/坪；車位未單獨申報價格時無法拆分。資料來源：內政部實價登錄。")
+
+
+def _render_591_deals(report: AnalysisReport) -> None:
+    deals = getattr(report, "deals", None)
+    if not deals:
+        return
+    with st.expander(f"591 社區近期成交（{len(deals)} 筆，可能比官方開放資料新）"):
+        table = {
+            "成交年月": [d.date for d in deals],
+            "樓層": [d.floor or "—" for d in deals],
+            "格局": [d.layout or "—" for d in deals],
+            "坪數": [f"{d.area_ping:.2f}" if d.area_ping else "—" for d in deals],
+            "單價(萬/坪)": [f"{d.unit_price:.1f}" if d.unit_price else "—" for d in deals],
+            "總價(萬)": [f"{d.total_wan:,.0f}" if d.total_wan else "—" for d in deals],
+            "車位": [d.parking or "—" for d in deals],
+        }
+        st.dataframe(table, use_container_width=True, hide_index=True)
+        st.caption("591 的單價與坪數多未拆車位，且門牌常被遮蔽，僅供對照官方資料的時間落差，不作為本戶前次成交依據。")
+
+
 def render_photo_grid(images: list[str], columns: int = 3, max_images: int = 9) -> None:
     if not images:
         st.caption("查無照片")
@@ -282,6 +324,8 @@ def render_report(report: AnalysisReport, show_market: bool = True, compact: boo
         show_field("本戶前次成交", getattr(report, "previous_sale", "查無資料"))
         _render_price_gap(report)
         st.info(report.market_comment)
+        _render_building_deals(report)
+        _render_591_deals(report)
         st.markdown("</div>", unsafe_allow_html=True)
 
     photo_cols = 2 if compact else 3

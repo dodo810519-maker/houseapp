@@ -87,16 +87,30 @@ def _roc_year(value: str) -> Optional[int]:
 
 
 def _floor_to_int(text: str) -> Optional[int]:
+    """把實價登錄的「移轉層次」轉成樓層數字。地下為負、全層／多層一次移轉回傳 None。"""
     text = (text or "").translate(_FULLWIDTH_DIGITS)
-    digits = "".join(c for c in text if c.isdigit())
-    if digits:
-        return int(digits)
-    # 「十二層」「六層」這種中文層數
-    total = 0
+    if re.search(r"全層|見其他|見使用|整棟", text):
+        return None
+    if "，" in text or "," in text:
+        return None  # 「一層，二層，三層」是整棟或透天，不能當單層戶
+
+    underground = bool(re.search(r"地下|B\s*\d", text, re.I))
+    chinese = _chinese_floor(text)
+    if chinese is not None:
+        return -chinese if underground else chinese
+
+    match = re.search(r"(\d+)", text)
+    if match:
+        value = int(match.group(1))
+        return -value if underground else value
+    return None
+
+
+def _chinese_floor(text: str) -> Optional[int]:
     if "十" in text:
         head, _, tail = text.partition("十")
-        total = (_CN_NUMERALS.get(head, 1) if head else 1) * 10
-        total += _CN_NUMERALS.get(tail[:1], 0) if tail else 0
+        total = (_CN_NUMERALS.get(head[:1], 1) if head and head[:1] in _CN_NUMERALS else 1) * 10
+        total += _CN_NUMERALS.get(tail[:1], 0) if tail and tail[:1] in _CN_NUMERALS else 0
         return total
     for char in text:
         if char in _CN_NUMERALS:

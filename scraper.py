@@ -81,6 +81,8 @@ class AnalysisReport:
     total_price_range: str
     market_comment: str
     previous_sale: str = UNKNOWN
+    building_deals: list = field(default_factory=list)
+    building_deal_scope: str = ""
     interior_images: list[str] = field(default_factory=list)
     community_images: list[str] = field(default_factory=list)
     latitude: Optional[float] = None
@@ -139,9 +141,15 @@ def _info_map(items: list) -> dict:
 
 
 def _parse_591_id(url: str) -> str:
-    match = re.search(r"sale\.591\.com\.tw/home/house/detail/\d+/(\d+)", url)
+    """接受電腦版、手機版、以及只貼物件編號。"""
+    text = (url or "").strip()
+    if re.fullmatch(r"\d{6,}", text):
+        return text
+    match = re.search(r"(?:sale|m|house)\.591\.com\.tw/.*?(\d{6,})", text)
     if not match:
-        match = re.search(r"/(\d{6,})\.html", url)
+        match = re.search(r"/(\d{6,})\.html", text)
+    if not match:
+        match = re.search(r"(?:id|house_id|post_id)=(\d{6,})", text)
     if not match:
         raise ValueError("這不是有效的 591 售屋網址，請確認後再試。")
     return match.group(1)
@@ -1206,9 +1214,43 @@ def estimate_market(
     return unit_price_range, total_price_range, comment
 
 
+def _roc_year_month(text: str) -> Optional[tuple[int, int]]:
+    match = re.search(r"(\d{2,3})[-/](\d{1,2})", text or "")
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
+def _deal_newer_than_official(date_text: str) -> bool:
+    """591 成交年月是否晚於目前已公布的實價登錄季別。"""
+    parsed = _roc_year_month(date_text)
+    if not parsed:
+        return False
+    latest = plvr.recent_seasons()[0]
+    year, quarter = int(latest[:3]), int(latest[-1])
+    return parsed > (year, quarter * 3)
+
+
 def _first_int(text: str) -> Optional[int]:
     match = re.search(r"\d+", _clean(text or ""))
     return int(match.group(0)) if match else None
+
+
+def parse_listing_floor(text: str) -> Optional[int]:
+    """解析 591 樓層欄，例如 3F/5F、B1、頂樓加蓋。回傳本戶所在層，地下為負。"""
+    text = _clean(text or "")
+    if not text or text == UNKNOWN:
+        return None
+    if re.search(r"頂樓加蓋|加蓋|整棟|全層|見使用層", text):
+        return None
+    if re.search(r"B\s*1|地下\s*一層|地下\s*1", text, re.I):
+        return -1
+    if re.search(r"B\s*2|地下\s*二層|地下\s*2", text, re.I):
+        return -2
+    match = re.search(r"(\d+)\s*(?:F|樓|層)", text, re.I)
+    if match:
+        return int(match.group(1))
+    return _first_int(text)
 
 
 def _plvr_parking_keywords(registered_type: str, parking_desc: str) -> tuple[str, ...]:
@@ -1234,6 +1276,20 @@ def _plvr_parking_keywords(registered_type: str, parking_desc: str) -> tuple[str
     return ()
 
 
+@dataclass
+class MarketEstimate:
+    unit_price_range: Optional[str] = None
+    total_price_range: Optional[str] = None
+    comment: Optional[str] = None
+    previous_sale: str = UNKNOWN
+    building_deals: list = field(default_factory=list)
+    building_scope: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return bool(self.unit_price_range)
+
+
 def estimate_market_from_plvr(
     want: dict,
     door_numbers: set[int],
@@ -1244,20 +1300,17 @@ def estimate_market_from_plvr(
     house_age: str,
     floor_text: str,
     sources: list[str],
-) -> tuple[Optional[str], Optional[str], Optional[str], str]:
-    """以內政部實價登錄推估行情，回傳 (單價區間, 總價區間, 說明, 本戶前次成交)。
-
-    找不到可用資料時回傳 (None, None, None, UNKNOWN)，交由 591 的估算接手。
-    """
-    if not want.get("city") or not registered_ping:
-        return None, None, None, UNKNOWN
+) -> MarketEstimate:
+    """以內政部實價登錄推估行情。估不出來時 unit_price_range 為 None，交由 591 的估算接手。"""
+    if not want.get("city"):
+        return MarketEstimate()
 
     try:
         deals, seasons = plvr.load_city_deals(want["city"])
     except Exception:
-        return None, None, None, UNKNOWN
+        return MarketEstimate()
     if not deals:
-        return None, None, None, UNKNOWN
+        return MarketEstimate()
 
     total_floor = _first_int(building_floors)
     age = _first_int(house_age)
@@ -1272,7 +1325,7 @@ def estimate_market_from_plvr(
         sources.append(f"實價登錄同棟成交 {len(building_deals)} 筆（比對方式：{building_scope}）")
 
     previous, certain = plvr.find_previous_sale(
-        building_deals, registered_ping, parking_ping, _first_int(floor_text)
+        building_deals, registered_ping, parking_ping, parse_listing_floor(floor_text)
     )
     previous_text = UNKNOWN
     if previous:
@@ -1294,18 +1347,26 @@ def estimate_market_from_plvr(
         build_year=build_year,
         building_type=previous.building_type if previous else "",
     )
+    result = MarketEstimate(
+        previous_sale=previous_text,
+        building_deals=sorted(building_deals, key=lambda d: d.date, reverse=True),
+        building_scope=building_scope,
+    )
+
     low_unit, mid_unit, high_unit, sample = plvr.unit_price_quartiles(comparables)
     if not low_unit or not high_unit:
-        return None, None, None, previous_text
+        return result
 
-    house_ping = registered_ping - (parking_ping or 0)
-    if house_ping <= 0:
-        house_ping = registered_ping
+    house_ping = None
+    if registered_ping:
+        house_ping = registered_ping - (parking_ping or 0)
+        if house_ping <= 0:
+            house_ping = registered_ping
 
     unit_range = f"{low_unit}～{high_unit} 萬/坪"
-    parking_note = "本戶無車位，總價僅含房屋本身。"
-    total_low = round(low_unit * house_ping)
-    total_high = round(high_unit * house_ping)
+    parking_note = "本戶無車位，總價僅含房屋本身。" if not parking_ping else ""
+    total_low = round(low_unit * house_ping) if house_ping else None
+    total_high = round(high_unit * house_ping) if house_ping else None
 
     if parking_ping and parking_ping > 0:
         park_low, park_high, _, park_note = plvr.parking_price_range(
@@ -1314,22 +1375,28 @@ def estimate_market_from_plvr(
             _plvr_parking_keywords(previous.parking_type if previous else "", parking_desc),
         )
         if park_low and park_high:
-            total_low += park_low
-            total_high += park_high
+            if total_low is not None and total_high is not None:
+                total_low += park_low
+                total_high += park_high
             span = f"{park_low} 萬" if park_low == park_high else f"{park_low}～{park_high} 萬"
             parking_note = f"車位約 {parking_ping:.2f} 坪，估 {span}（{park_note}）。"
         else:
             parking_note = f"車位約 {parking_ping:.2f} 坪，但查無同區車位申報價，總價未計入車位。"
 
-    comment = (
+    result.unit_price_range = unit_range
+    result.total_price_range = (
+        f"{total_low}～{total_high} 萬" if total_low is not None and total_high is not None else None
+    )
+    ping_note = f"本戶扣除車位後約 {house_ping:.2f} 坪。" if house_ping else "本戶權狀坪數未知，僅提供單價區間。"
+    result.comment = (
         f"依內政部實價登錄近 {len(seasons)} 季資料，取「{tier}」共 {sample} 筆成交，"
-        f"房屋單價中位 {mid_unit} 萬/坪；本戶扣除車位後約 {house_ping:.2f} 坪。{parking_note}"
+        f"房屋單價中位 {mid_unit} 萬/坪；{ping_note}{parking_note}"
     )
     sources.append(
         f"內政部實價登錄開放資料（{seasons[-1]}～{seasons[0]}，{want['city']}買賣 {len(deals)} 筆）"
     )
     sources.append(f"行情比對範圍：{tier}（{sample} 筆）")
-    return unit_range, f"{total_low}～{total_high} 萬", comment, previous_text
+    return result
 
 
 def _extract_parking_type(parking_desc: str) -> str:
@@ -1824,7 +1891,7 @@ def analyze_591(url: str) -> AnalysisReport:
         if number
     }
 
-    unit_range, total_range, comment, previous_sale = estimate_market_from_plvr(
+    market = estimate_market_from_plvr(
         want,
         door_numbers,
         registered_ping,
@@ -1835,7 +1902,9 @@ def analyze_591(url: str) -> AnalysisReport:
         floor_text,
         sources,
     )
-    if not unit_range:
+    unit_range, total_range, comment = market.unit_price_range, market.total_price_range, market.comment
+    previous_sale = market.previous_sale
+    if not market.ok:
         unit_range, total_range, comment = estimate_market(
             registered_ping,
             parking_area,
@@ -1844,6 +1913,14 @@ def analyze_591(url: str) -> AnalysisReport:
             ask_unit_price_str=str(base.get("unitPrice") or info.get("單價") or ""),
         )
         sources.append("實價登錄比對不足，行情改以 591 社區成交估算")
+
+    deals_591 = community.get("deals", [])[:12]
+    fresh_591 = [d for d in deals_591 if _deal_newer_than_official(d.date)]
+    if fresh_591 and comment:
+        comment += (
+            f" 591 社區頁另有 {len(fresh_591)} 筆晚於官方開放資料的成交，"
+            "請一併參考下方「591 社區近期成交」。"
+        )
 
     bathroom_window = detect_bathroom_window(detail.get("remark", ""), base.get("title", ""))
     image_urls = fetch_listing_images(house_id)
@@ -1895,22 +1972,100 @@ def analyze_591(url: str) -> AnalysisReport:
         total_price_range=_or_unknown(total_range),
         market_comment=_or_unknown(comment),
         previous_sale=previous_sale,
+        building_deals=market.building_deals,
+        building_deal_scope=market.building_scope,
         interior_images=image_urls[:16],
         community_images=community_images,
         latitude=community_lat,
         longitude=community_lon,
         pros=pros,
         cons=cons,
-        deals=community.get("deals", [])[:12],
+        deals=deals_591,
+        sources=sources,
+    )
+
+
+def analyze_leju_community_url(url: str) -> AnalysisReport:
+    """直接貼樂居社區頁時，仍可產出社區環境與同棟實價登錄，但沒有單一戶的權狀與開價。"""
+    match = re.search(r"/community/(L[A-Za-z0-9]+)", url)
+    if not match:
+        raise ValueError("這不是有效的樂居社區頁網址。分析單一戶請改貼 591 售屋網址。")
+    community_id = match.group(1)
+    html = _fetch_leju_html(f"https://www.leju.com.tw/community/{community_id}")
+    leju = parse_leju_community_html(html, community_id)
+    if not leju.get("name"):
+        raise ValueError("樂居社區頁讀取失敗，請稍後再試，或改貼 591 售屋網址。")
+
+    sources = [f"樂居社區頁：{leju.get('url') or url}"]
+    report_fields = merge_community_fields(
+        {
+            "community_name": "",
+            "land_area": "",
+            "household_count": "",
+            "building_floors": "",
+            "public_ratio": "",
+            "community_address": "",
+        },
+        leju,
+        sources,
+    )
+    want = _split_tw_address(report_fields["community_address"], leju.get("address", ""))
+    door_numbers = {n for n in [plvr.door_number(leju.get("address", ""))] if n}
+    market = estimate_market_from_plvr(
+        want,
+        door_numbers,
+        None,
+        None,
+        "",
+        report_fields["building_floors"],
+        "",
+        "",
+        sources,
+    )
+    return AnalysisReport(
+        title=report_fields["community_name"],
+        listing_id=community_id,
+        source_url=leju.get("url") or url,
+        image_url="",
+        ask_price_wan=None,
+        ask_unit_price=UNKNOWN,
+        layout=UNKNOWN,
+        community_name=report_fields["community_name"],
+        land_area=report_fields["land_area"],
+        household_count=report_fields["household_count"],
+        building_floors=report_fields["building_floors"],
+        public_ratio=report_fields["public_ratio"],
+        community_address=report_fields["community_address"],
+        listing_address=UNKNOWN,
+        nearest_mrt=UNKNOWN,
+        nearest_supermarket=UNKNOWN,
+        registered_area=UNKNOWN,
+        parking_status=UNKNOWN,
+        house_age=UNKNOWN,
+        main_building_area=UNKNOWN,
+        registered_use=UNKNOWN,
+        floor=UNKNOWN,
+        bathroom_window=UNKNOWN,
+        lighting_faces=UNKNOWN,
+        unit_price_range=_or_unknown(market.unit_price_range),
+        total_price_range=_or_unknown(market.total_price_range),
+        market_comment=_or_unknown(market.comment) + " 這是社區頁，沒有單一戶開價與權狀，總價區間無法估算。",
+        previous_sale=UNKNOWN,
+        building_deals=market.building_deals,
+        building_deal_scope=market.building_scope,
         sources=sources,
     )
 
 
 def analyze_url(url: str) -> AnalysisReport:
-    parsed = urlparse(url.strip())
-    host = parsed.netloc.lower()
-    if "591.com.tw" in host:
-        return analyze_591(url)
-    if "rakuya.com.tw" in host or "leju.com.tw" in host:
-        raise ValueError("樂屋／樂居網址尚不支援直接貼上。請先使用 591 售屋網址，系統會自動補查社區與實價登錄。")
-    raise ValueError("目前請貼上 591 售屋網的房屋網址。")
+    text = (url or "").strip()
+    if re.fullmatch(r"\d{6,}", text):
+        return analyze_591(text)
+    host = urlparse(text).netloc.lower()
+    if "591.com.tw" in host or (not host and "591" in text):
+        return analyze_591(text)
+    if "leju.com.tw" in host and "/community/" in text:
+        return analyze_leju_community_url(text)
+    if "rakuya.com.tw" in host:
+        raise ValueError("樂屋網址尚不支援。請改貼 591 售屋網址（電腦版、手機版或物件編號都可以），系統會自動去樂居與實價登錄補資料。")
+    raise ValueError("目前請貼上 591 售屋網址（電腦版、手機版或物件編號都可以）。樂居社區頁也可以，但沒有單一戶的開價與權狀。")
