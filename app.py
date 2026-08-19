@@ -242,13 +242,22 @@ def render_photo_grid(images: list[str], columns: int = 3, max_images: int = 9) 
 
 def render_google_map(report: AnalysisReport) -> None:
     map_address = report.community_address
-    if not map_address or map_address == "查無資料":
+    listing_address = getattr(report, "listing_address", "")
+    display_addr = ""
+    if map_address and map_address != "查無資料":
+        display_addr = map_address.split("（")[0].strip()
+    elif listing_address and listing_address != "查無資料":
+        display_addr = listing_address.split("（")[0].strip()
+
+    if report.latitude and report.longitude:
+        query = f"{report.latitude},{report.longitude}"
+    elif display_addr:
+        query = display_addr
+    else:
         st.caption("無法取得社區登記地址，無法顯示地圖。")
         return
 
-    display_addr = map_address.split("（")[0].strip()
-    st.markdown(f"**{html.escape(display_addr)}**")
-    query = display_addr
+    st.markdown(f"**{html.escape(display_addr or query)}**")
 
     map_url = (
         "https://maps.google.com/maps?"
@@ -399,7 +408,7 @@ with st.container():
         with c_input:
             st.text_input(
                 "房屋網址",
-                placeholder="貼上房屋網址…",
+                placeholder="591、樂屋、信義、永慶、住商、台灣房屋、好房網、東森…",
                 key="single_url",
                 label_visibility="collapsed",
             )
@@ -415,7 +424,7 @@ with st.container():
             st.button("🗑 清空全部", on_click=clear_compare_urls, use_container_width=True)
         st.text_area(
             "多個房屋網址",
-            placeholder="貼上多個網址，每行一個…",
+            placeholder="每行一個網址：591、樂屋、信義、永慶、住商、台灣房屋、好房網、東森…",
             height=90,
             key="compare_urls",
             label_visibility="collapsed",

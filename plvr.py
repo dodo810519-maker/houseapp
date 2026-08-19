@@ -414,17 +414,20 @@ def find_previous_sale(
     total_ping: Optional[float],
     parking_ping: Optional[float] = None,
     floor_no: Optional[int] = None,
+    parking_known: bool = True,
 ) -> tuple[Optional[LandDeal], bool]:
     """在同棟成交中指認本戶的上一次成交，回傳 (成交, 是否確定為本戶)。
 
     同一棟常有多戶坪數相同，光靠坪數會抓到隔壁戶，因此樓層與車位坪數都是硬性條件；
     樓層不明、或同樓層仍有多筆同坪數成交時，只能說是「疑似」，交由呼叫端據實標示。
+    刊登有車位但未獨立標示坪數時 parking_known=False，此時不把車位當成 0 坪硬篩。
     """
     if not total_ping:
         return None, False
 
     matches = [d for d in building_deals if abs(d.total_ping - total_ping) <= 0.3]
-    matches = [d for d in matches if abs(d.parking_ping - (parking_ping or 0)) <= 0.3]
+    if parking_known:
+        matches = [d for d in matches if abs(d.parking_ping - (parking_ping or 0)) <= 0.3]
     if floor_no:
         matches = [d for d in matches if d.floor_no == floor_no]
     if not matches:

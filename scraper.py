@@ -430,15 +430,59 @@ def _parse_unit_price(text: str) -> Optional[float]:
     return float(match.group(1)) if match else None
 
 
-def fetch_community_id(house_id: str) -> str:
-    html = _fetch(f"https://sale.591.com.tw/home/house/detail/2/{house_id}.html")
+def _community_id_from_html(html: str) -> str:
+    """只接受物件自己綁定的社區，不抓頁面上「熱門成交／在售」的其他社區連結。"""
     match = re.search(r'id="hid_communityId"\s+value="(\d+)"', html)
     if match and match.group(1) not in {"", "0"}:
         return match.group(1)
-    for cid in re.findall(r"market\.591\.com\.tw/(\d+)", html):
-        if cid not in {"0"} and len(cid) >= 4:
-            return cid
     return ""
+
+
+def fetch_community_id(house_id: str) -> str:
+    html = _fetch(f"https://sale.591.com.tw/home/house/detail/2/{house_id}.html")
+    return _community_id_from_html(html)
+
+
+def _community_name_from_listing(html: str, base: dict) -> str:
+    """物件未綁定社區頁時，從 API、meta、標題把社區名找回來。"""
+    name = _clean(base.get("communityName") or "")
+    if name:
+        return name
+    desc = re.search(r'<meta name="description" content="([^"]*)"', html or "", re.I)
+    blob = html_module.unescape(desc.group(1)) if desc else ""
+    blob += " " + _clean(base.get("title") or "")
+    for match in re.finditer(r"位於([^，,。]{2,30})", blob):
+        candidate = _clean(match.group(1)).lstrip("：:")
+        if not candidate or re.search(r"\d|電話|路|街|巷|弄|號", candidate):
+            continue
+        if _looks_like_community_name(candidate):
+            return candidate
+    starred = re.search(r"[☆★]([^☆★]{2,20})[☆★]", _clean(base.get("title") or ""))
+    if starred and _looks_like_community_name(starred.group(1)):
+        return _clean(starred.group(1))
+    return ""
+
+
+def _community_belongs_to_listing(community: dict, community_detail: dict, base: dict) -> bool:
+    """591 社區頁若跟物件不同行政區、或座標差太遠，視為抓錯社區。"""
+    addr = base.get("address") or {}
+    listing_dist = _clean(addr.get("section") or "")
+    comm_addr = _clean((community or {}).get("address") or (community_detail or {}).get("address") or "")
+    comm_section = _clean((community_detail or {}).get("section") or "")
+    if listing_dist:
+        if comm_section and _leju_norm(comm_section) != _leju_norm(listing_dist):
+            return False
+        districts = re.findall(r"[\u4e00-\u9fff]{1,2}區", comm_addr)
+        if districts and listing_dist not in districts:
+            return False
+    listing_lat = _to_float(addr.get("lat"))
+    listing_lon = _to_float(addr.get("lng"))
+    comm_lat = _to_float((community_detail or {}).get("lat"))
+    comm_lon = _to_float((community_detail or {}).get("lng"))
+    if listing_lat and listing_lon and comm_lat and comm_lon:
+        if _haversine_m(listing_lat, listing_lon, comm_lat, comm_lon) > 1500:
+            return False
+    return True
 
 
 def parse_community_page(html: str) -> dict:
@@ -752,8 +796,8 @@ def detect_bathroom_window(remark_html: str, title: str) -> str:
     return f"{UNDETERMINED}（物件描述未提及，需看照片或現場確認）"
 
 
-def fetch_listing_images(house_id: str) -> list[str]:
-    html = _fetch(f"https://sale.591.com.tw/home/house/detail/2/{house_id}.html")
+def fetch_listing_images(house_id: str, html: str = "") -> list[str]:
+    html = html or _fetch(f"https://sale.591.com.tw/home/house/detail/2/{house_id}.html")
     match = re.search(r'id="hid_imgs"\s+value="([^"]+)"', html)
     if not match:
         return []
@@ -944,6 +988,8 @@ def build_pros_cons(
     lighting_faces: str,
     market_comment: str,
     household_count: str,
+    has_parking: Optional[bool] = None,
+    parking_bundled: bool = False,
 ) -> tuple[list[str], list[str]]:
     pros: list[str] = []
     cons: list[str] = []
@@ -957,10 +1003,15 @@ def build_pros_cons(
 
     ratio = _ratio_value(public_ratio)
     if ratio is not None:
-        if ratio <= 30:
+        if ratio <= 30 and not parking_bundled:
             pros.append(f"公設比約 {ratio:.0f}%，實際可用空間比例較高。")
         elif ratio >= 35:
-            cons.append(f"公設比約 {ratio:.0f}% 偏高，等於花錢買公共空間，實坪偏少。")
+            if parking_bundled:
+                cons.append(
+                    f"刊登公設比約 {ratio:.0f}%，但車位含在共有部分，未扣除車位前看起來偏高。"
+                )
+            else:
+                cons.append(f"公設比約 {ratio:.0f}% 偏高，等於花錢買公共空間，實坪偏少。")
 
     mrt_m = _meters_value(nearest_mrt)
     if mrt_m is not None:
@@ -975,7 +1026,10 @@ def build_pros_cons(
     elif shop_m is not None and shop_m >= 1200:
         cons.append(f"最近超市約 {shop_m} 公尺，採買需要開車或騎車。")
 
-    if registered_ping and main_ping and registered_ping > 0:
+    if has_parking is None:
+        has_parking = bool(parking_ping and parking_ping > 0) or parking_bundled
+
+    if registered_ping and main_ping and registered_ping > 0 and not parking_bundled:
         usable = registered_ping - (parking_ping or 0)
         if usable > 0:
             main_pct = main_ping / usable * 100
@@ -988,7 +1042,10 @@ def build_pros_cons(
 
     if parking_ping and parking_ping >= 5:
         pros.append(f"含車位約 {parking_ping} 坪，都會區稀缺、保值性較佳。")
-    elif parking_ping in (None, 0):
+    elif parking_bundled:
+        if ratio is None or ratio < 35:
+            cons.append("車位坪數未獨立標示，多半含在共有部分，刊登公設比需另外扣除車位。")
+    elif not has_parking:
         cons.append("未含車位，若有停車需求需額外承租或購買。")
 
     floor_match = re.match(r"(\d+)F/(\d+)F", floor or "")
@@ -1107,6 +1164,7 @@ def estimate_market(
     community_avg: str,
     deals: list[Deal],
     ask_unit_price_str: str = "",
+    parking_bundled: bool = False,
 ) -> tuple[str, str, str]:
     comparable = []
     for deal in deals:
@@ -1187,27 +1245,35 @@ def estimate_market(
                 parking_text = f"{parking_low}～{parking_high} 萬"
             total_price_range = f"{total_low}～{total_high} 萬（包含車位 {parking_text}）"
             parking_note = f"{parking_source}，本戶車位約 {parking_ping:.1f} 坪。"
+        elif parking_bundled:
+            total_price_range = f"{house_low}～{house_high} 萬"
+            parking_note = "刊登車位未獨立標示坪數（多含於公設），權狀未拆車位，總價以整戶估算、未另加車位價。"
         else:
             total_price_range = f"{house_low}～{house_high} 萬"
             parking_note = "本戶無車位，總價僅含房屋本身。"
 
+        ping_phrase = (
+            f"權狀約 {house_ping:.2f} 坪（含車位未拆）"
+            if parking_bundled
+            else f"不含車位坪數約 {house_ping:.2f} 坪"
+        )
         if estimate_source == "deals" and comparable:
             comment = (
                 f"依同社區近年相似成交（{min(d.area_ping for d in comparable):.1f}～"
                 f"{max(d.area_ping for d in comparable):.1f} 坪）推估，"
-                f"不含車位坪數約 {house_ping:.2f} 坪。{parking_note}"
+                f"{ping_phrase}。{parking_note}"
             )
             if avg_text != UNKNOWN:
                 comment = f"{avg_text}。{comment}"
         elif estimate_source == "community_avg":
             comment = (
                 f"成交明細不足，改以社區均價 {median_unit} 萬/坪估算，"
-                f"不含車位坪數約 {house_ping:.2f} 坪。{parking_note}"
+                f"{ping_phrase}。{parking_note}"
             )
         else:
             comment = (
                 f"無法取得社區成交，改以刊登單價 {median_unit} 萬/坪粗估，"
-                f"不含車位坪數約 {house_ping:.2f} 坪。{parking_note}"
+                f"{ping_phrase}。{parking_note}"
             )
     elif not house_ping:
         comment = "權狀坪數資料不足，暫無法估價。"
@@ -1242,6 +1308,8 @@ def parse_listing_floor(text: str) -> Optional[int]:
     if not text or text == UNKNOWN:
         return None
     if re.search(r"頂樓加蓋|加蓋|整棟|全層|見使用層", text):
+        return None
+    if re.search(r"\d+\s*[-~～到至]\s*\d+", text):
         return None
     if re.search(r"B\s*1|地下\s*一層|地下\s*1", text, re.I):
         return -1
@@ -1300,6 +1368,7 @@ def estimate_market_from_plvr(
     house_age: str,
     floor_text: str,
     sources: list[str],
+    parking_bundled: bool = False,
 ) -> MarketEstimate:
     """以內政部實價登錄推估行情。估不出來時 unit_price_range 為 None，交由 591 的估算接手。"""
     if not want.get("city"):
@@ -1325,7 +1394,11 @@ def estimate_market_from_plvr(
         sources.append(f"實價登錄同棟成交 {len(building_deals)} 筆（比對方式：{building_scope}）")
 
     previous, certain = plvr.find_previous_sale(
-        building_deals, registered_ping, parking_ping, parse_listing_floor(floor_text)
+        building_deals,
+        registered_ping,
+        parking_ping,
+        parse_listing_floor(floor_text),
+        parking_known=not parking_bundled,
     )
     previous_text = UNKNOWN
     if previous:
@@ -1364,7 +1437,13 @@ def estimate_market_from_plvr(
             house_ping = registered_ping
 
     unit_range = f"{low_unit}～{high_unit} 萬/坪"
-    parking_note = "本戶無車位，總價僅含房屋本身。" if not parking_ping else ""
+    has_parking = bool(parking_ping and parking_ping > 0) or parking_bundled
+    if parking_bundled:
+        parking_note = "刊登車位未獨立標示坪數（多含於公設），權狀未拆車位，總價以整戶估算、未另加車位價。"
+    elif not has_parking:
+        parking_note = "本戶無車位，總價僅含房屋本身。"
+    else:
+        parking_note = ""
     total_low = round(low_unit * house_ping) if house_ping else None
     total_high = round(high_unit * house_ping) if house_ping else None
 
@@ -1387,7 +1466,12 @@ def estimate_market_from_plvr(
     result.total_price_range = (
         f"{total_low}～{total_high} 萬" if total_low is not None and total_high is not None else None
     )
-    ping_note = f"本戶扣除車位後約 {house_ping:.2f} 坪。" if house_ping else "本戶權狀坪數未知，僅提供單價區間。"
+    if not house_ping:
+        ping_note = "本戶權狀坪數未知，僅提供單價區間。"
+    elif parking_bundled:
+        ping_note = f"本戶權狀約 {house_ping:.2f} 坪（含車位未拆）。"
+    else:
+        ping_note = f"本戶扣除車位後約 {house_ping:.2f} 坪。"
     result.comment = (
         f"依內政部實價登錄近 {len(seasons)} 季資料，取「{tier}」共 {sample} 筆成交，"
         f"房屋單價中位 {mid_unit} 萬/坪；{ping_note}{parking_note}"
@@ -1397,6 +1481,24 @@ def estimate_market_from_plvr(
     )
     sources.append(f"行情比對範圍：{tier}（{sample} 筆）")
     return result
+
+
+PUBLIC_RATIO_PARKING_NOTE = "需另外扣除車位"
+_PARKING_TYPE_HINTS = ("坡道平面", "平面式", "機械式", "升降式", "立體式", "塔式", "坡道機械")
+_PARKING_INCLUDE_HINTS = ("含車位", "有車位", "已含售金", "車位已含", "含於售價", "含在售價")
+
+
+def _text_says_has_parking(*texts: str) -> bool:
+    blob = " ".join(_clean(t or "") for t in texts)
+    if not blob:
+        return False
+    if "無車位" in blob and "含車位" not in blob and "有車位" not in blob:
+        return False
+    if any(hint in blob for hint in _PARKING_TYPE_HINTS):
+        return True
+    if any(hint in blob for hint in _PARKING_INCLUDE_HINTS):
+        return True
+    return bool(re.search(r"(?<!無)車位", blob))
 
 
 def _extract_parking_type(parking_desc: str) -> str:
@@ -1413,21 +1515,31 @@ def _extract_parking_type(parking_desc: str) -> str:
     return ""
 
 
-def _format_parking_status(has_parking: bool, parking_desc: str) -> str:
+def _format_parking_status(has_parking: bool, parking_desc: str, bundled: bool = False) -> str:
     if not has_parking:
         return "無"
     parking_type = _extract_parking_type(parking_desc)
+    extra = "；坪數未獨立標示" if bundled else ""
     if parking_type:
-        return f"有（{parking_type}）"
+        return f"有（{parking_type}{extra}）"
+    if bundled:
+        return "有（坪數未獨立標示）"
     return "有"
 
 
-def _parse_parking_info(areas: dict, base: dict) -> tuple[Optional[float], str]:
+def _parse_parking_info(areas: dict, base: dict) -> tuple[Optional[float], str, bool]:
+    """回傳 (車位坪數, 狀態文字, 車位是否含在公設而未獨立標示)。"""
     parking_raw = _clean(areas.get("車位面積") or "")
     parking_desc = _clean(base.get("parking") or "")
+    area_text = " ".join(
+        [
+            _clean(areas.get("登記總面積") or ""),
+            _clean(base.get("unitArea") or ""),
+        ]
+    )
 
     if "無車位" in parking_desc:
-        return None, "無"
+        return None, "無", False
 
     parking_ping = None
     if parking_raw not in ("-", "—", "0", "0坪", "無", ""):
@@ -1437,16 +1549,24 @@ def _parse_parking_info(areas: dict, base: dict) -> tuple[Optional[float], str]:
         if match:
             parking_ping = _to_float(match.group(1))
 
-    if parking_ping and parking_ping > 0:
-        return parking_ping, _format_parking_status(True, parking_desc)
+    has_parking = bool(parking_ping and parking_ping > 0) or _text_says_has_parking(
+        parking_desc, area_text
+    )
+    bundled = bool(has_parking and not (parking_ping and parking_ping > 0))
+    if has_parking:
+        return parking_ping, _format_parking_status(True, parking_desc, bundled), bundled
+    return None, "無", False
 
-    if parking_desc and "車位" in parking_desc and re.search(r"[\d.]+\s*坪", parking_desc):
-        return parking_ping, _format_parking_status(True, parking_desc)
 
-    if parking_raw in ("-", "—", "0", "0坪", "無"):
-        return None, "無"
-
-    return None, "無"
+def _annotate_public_ratio(ratio: str, bundled: bool) -> str:
+    text = _clean(ratio or "")
+    if not bundled or not text or text == UNKNOWN:
+        return ratio if ratio else UNKNOWN
+    if PUBLIC_RATIO_PARKING_NOTE in text:
+        return text
+    if text.endswith("）"):
+        return text[:-1] + f"；{PUBLIC_RATIO_PARKING_NOTE}）"
+    return f"{text}（{PUBLIC_RATIO_PARKING_NOTE}）"
 
 
 _LEJU_OPENER = None
@@ -1636,9 +1756,11 @@ def _pick_leju_candidate(candidates: list[dict], want: dict, community_name: str
             elif target_name in item_name or item_name in target_name:
                 score = 2
             else:
-                score = 1
-        else:
+                continue
+        elif not target_name:
             score = 1
+        else:
+            continue
         scored.append((score, item))
     if not scored:
         return None
@@ -1681,10 +1803,11 @@ def fetch_leju_community(community_name: str, community_address: str, listing_ad
 
 
 def _leju_result_matches(parsed: dict, candidate: dict, want: dict, community_name: str) -> bool:
-    """社區名一致就採用；名稱對不上時，至少要同一條路。"""
-    if _leju_norm(parsed.get("name", "")) and _leju_norm(community_name):
-        if _leju_norm(community_name) in _leju_norm(parsed["name"]) or _leju_norm(parsed["name"]) in _leju_norm(community_name):
-            return True
+    """社區名一致就採用；雙方都有名稱卻對不上時，不因同一條路就硬配。"""
+    parsed_name = _leju_norm(parsed.get("name", ""))
+    target_name = _leju_norm(community_name)
+    if parsed_name and target_name:
+        return target_name in parsed_name or parsed_name in target_name
     if want["road"] and want["road"] in _clean(parsed.get("address", "")):
         return True
     return False
@@ -1759,13 +1882,24 @@ def merge_community_fields(fields_591: dict, leju: dict, sources: list[str]) -> 
     return merged
 
 
-def _format_registered_area(registered: str, parking_ping: Optional[float]) -> str:
+def _format_registered_area(
+    registered: str,
+    parking_ping: Optional[float],
+    *,
+    has_parking: bool = False,
+    bundled: bool = False,
+    parking_unknown: bool = False,
+) -> str:
     ping = _to_float(registered)
     if ping is None:
         text = _clean(registered or "")
         return text if text else UNKNOWN
     if parking_ping and parking_ping > 0:
         return f"{ping:.2f}坪（內含車位 {parking_ping:.2f}坪）"
+    if bundled or has_parking:
+        return f"{ping:.2f}坪（含車位，坪數未獨立標示）"
+    if parking_unknown:
+        return f"{ping:.2f}坪"
     return f"{ping:.2f}坪（無車位）"
 
 
@@ -1803,7 +1937,9 @@ def analyze_591(url: str) -> AnalysisReport:
     areas = _info_map(base.get("areaIntro"))
     gtm = detail.get("gtm_detail_data") or {}
 
-    community_id = fetch_community_id(house_id)
+    listing_html = _fetch(f"https://sale.591.com.tw/home/house/detail/2/{house_id}.html")
+    community_id = _community_id_from_html(listing_html)
+    name_hint = _community_name_from_listing(listing_html, base)
     community_html = ""
     community = {}
     community_detail = {}
@@ -1811,9 +1947,14 @@ def analyze_591(url: str) -> AnalysisReport:
     if community_id:
         community_url = f"https://market.591.com.tw/{community_id}"
         community_html = _fetch(community_url)
-        community = parse_community_page(community_html)
-        community_detail = fetch_community_detail(community_id)
-        sources.append(f"591 實價登錄社區頁：{community_url}")
+        parsed_community = parse_community_page(community_html)
+        parsed_detail = fetch_community_detail(community_id)
+        if _community_belongs_to_listing(parsed_community, parsed_detail, base):
+            community = parsed_community
+            community_detail = parsed_detail
+            sources.append(f"591 實價登錄社區頁：{community_url}")
+        else:
+            community_html = ""
     listing_address = _build_listing_address(base)
     community_address = _build_address(base, community.get("address", ""))
 
@@ -1823,8 +1964,8 @@ def analyze_591(url: str) -> AnalysisReport:
     community_lon = _to_float(community_detail.get("lng"))
 
     api_key = _google_maps_api_key()
-    nearby_lat = community_lat or listing_lat
-    nearby_lon = community_lon or listing_lon
+    nearby_lat = listing_lat or community_lat
+    nearby_lon = listing_lon or community_lon
     if (not nearby_lat or not nearby_lon) and api_key:
         nearby_lat, nearby_lon = geocode_google(community_address, api_key)
     nearest_mrt, nearest_shop = UNKNOWN, UNKNOWN
@@ -1844,7 +1985,8 @@ def analyze_591(url: str) -> AnalysisReport:
 
     registered = areas.get("登記總面積") or base.get("unitArea") or ""
     main_area = areas.get("主建物") or base.get("mainArea") or ""
-    parking_area, parking_status = _parse_parking_info(areas, base)
+    parking_area, parking_status, parking_bundled = _parse_parking_info(areas, base)
+    has_parking = parking_status != "無"
     registered_ping = _to_float(registered)
     ask_price = _to_float(base.get("price"))
 
@@ -1860,15 +2002,16 @@ def analyze_591(url: str) -> AnalysisReport:
 
     listing_address = _build_listing_address(base)
     community_address = _build_address(base, community.get("address", ""))
+    community_name = community.get("name") or name_hint or _clean(base.get("communityName") or "")
 
     leju = fetch_leju_community(
-        community.get("name") or _clean(base.get("communityName") or ""),
+        community_name,
         community_address,
         listing_address,
     )
 
     fields_591 = {
-        "community_name": community.get("name", ""),
+        "community_name": community_name,
         "land_area": community.get("land_area", ""),
         "household_count": community.get("household_count", ""),
         "building_floors": community.get("building_floors", ""),
@@ -1876,6 +2019,10 @@ def analyze_591(url: str) -> AnalysisReport:
         "community_address": community_address,
     }
     report_fields = merge_community_fields(fields_591, leju, sources)
+    if parking_bundled:
+        report_fields["public_ratio"] = _annotate_public_ratio(
+            report_fields["public_ratio"], True
+        )
 
     want = _split_tw_address(report_fields["community_address"], community_address, listing_address)
     door_numbers = {
@@ -1901,6 +2048,7 @@ def analyze_591(url: str) -> AnalysisReport:
         house_age,
         floor_text,
         sources,
+        parking_bundled=parking_bundled,
     )
     unit_range, total_range, comment = market.unit_price_range, market.total_price_range, market.comment
     previous_sale = market.previous_sale
@@ -1911,6 +2059,7 @@ def analyze_591(url: str) -> AnalysisReport:
             community.get("avg_unit", ""),
             community.get("deals", []),
             ask_unit_price_str=str(base.get("unitPrice") or info.get("單價") or ""),
+            parking_bundled=parking_bundled,
         )
         sources.append("實價登錄比對不足，行情改以 591 社區成交估算")
 
@@ -1923,13 +2072,13 @@ def analyze_591(url: str) -> AnalysisReport:
         )
 
     bathroom_window = detect_bathroom_window(detail.get("remark", ""), base.get("title", ""))
-    image_urls = fetch_listing_images(house_id)
+    image_urls = fetch_listing_images(house_id, listing_html)
     community_images = parse_community_images(community_html) if community_html else []
     lighting_faces = analyze_lighting_faces(detail.get("remark", ""), base.get("title", ""), image_urls)
 
     pros, cons = build_pros_cons(
         house_age=house_age,
-        public_ratio=public_ratio,
+        public_ratio=report_fields["public_ratio"],
         nearest_mrt=nearest_mrt,
         nearest_supermarket=nearest_shop,
         registered_ping=registered_ping,
@@ -1941,6 +2090,8 @@ def analyze_591(url: str) -> AnalysisReport:
         lighting_faces=lighting_faces,
         market_comment=comment,
         household_count=community.get("household_count", ""),
+        has_parking=has_parking,
+        parking_bundled=parking_bundled,
     )
 
     return AnalysisReport(
@@ -1960,7 +2111,9 @@ def analyze_591(url: str) -> AnalysisReport:
         listing_address=_or_unknown(listing_address),
         nearest_mrt=_or_unknown(nearest_mrt),
         nearest_supermarket=_or_unknown(nearest_shop),
-        registered_area=_format_registered_area(registered, parking_area),
+        registered_area=_format_registered_area(
+            registered, parking_area, has_parking=has_parking, bundled=parking_bundled
+        ),
         parking_status=parking_status,
         house_age=house_age,
         main_building_area=_or_unknown(main_area),
@@ -1976,8 +2129,8 @@ def analyze_591(url: str) -> AnalysisReport:
         building_deal_scope=market.building_scope,
         interior_images=image_urls[:16],
         community_images=community_images,
-        latitude=community_lat,
-        longitude=community_lon,
+        latitude=nearby_lat,
+        longitude=nearby_lon,
         pros=pros,
         cons=cons,
         deals=deals_591,
@@ -2057,6 +2210,828 @@ def analyze_leju_community_url(url: str) -> AnalysisReport:
     )
 
 
+@dataclass
+class PortalListing:
+    source_name: str
+    listing_id: str
+    source_url: str
+    title: str = ""
+    ask_price_wan: Optional[float] = None
+    ask_unit_price: str = ""
+    layout: str = ""
+    community_name: str = ""
+    listing_address: str = ""
+    registered: str = ""
+    main_area: str = ""
+    parking_desc: str = ""
+    parking_area: str = ""
+    house_age: str = ""
+    floor: str = ""
+    registered_use: str = ""
+    public_ratio: str = ""
+    management_fee: str = ""
+    remark: str = ""
+    images: list[str] = field(default_factory=list)
+    lat: Optional[float] = None
+    lon: Optional[float] = None
+    parking_unknown: bool = False
+
+
+def _fetch_page(url: str, referer: str = "") -> str:
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/131.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Referer": referer or url,
+        },
+    )
+    with urllib.request.urlopen(req, timeout=25, context=_ssl_context()) as response:
+        return response.read().decode("utf-8", "ignore")
+
+
+def _fetch_impersonated(url: str, referer: str = "") -> str:
+    """樂屋有 Cloudflare，一般 urllib 會 403，改用瀏覽器 TLS 指紋抓頁。"""
+    try:
+        from curl_cffi import requests as cffi_requests
+    except ImportError as exc:
+        raise ValueError("讀取樂屋需要 curl_cffi，請先執行：py -m pip install curl_cffi") from exc
+
+    headers = {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
+        "Referer": referer or "https://www.rakuya.com.tw/",
+    }
+    last_error = ""
+    for impersonate in ("chrome131", "chrome124", "chrome"):
+        try:
+            response = cffi_requests.get(
+                url, impersonate=impersonate, timeout=25, headers=headers
+            )
+            if response.status_code == 200 and response.text:
+                return response.text
+            last_error = f"HTTP {response.status_code}"
+        except Exception as exc:
+            last_error = str(exc)
+    raise ValueError(f"樂屋網頁被防護擋下（{last_error}），請稍後再試，或改貼 591／信義／永慶網址。")
+
+
+def _jsonld_blocks(html: str) -> list:
+    blocks = []
+    for match in re.finditer(
+        r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+        html,
+        re.S | re.I,
+    ):
+        try:
+            blocks.append(json.loads(match.group(1)))
+        except json.JSONDecodeError:
+            continue
+    return blocks
+
+
+def _walk_jsonld(blocks: list):
+    stack = list(blocks)
+    while stack:
+        item = stack.pop()
+        if isinstance(item, list):
+            stack.extend(item)
+        elif isinstance(item, dict):
+            yield item
+            stack.extend(item.values())
+
+
+def _html_plain_lines(html: str) -> list[str]:
+    text = re.sub(r"<script[\s\S]*?</script>", " ", html, flags=re.I)
+    text = re.sub(r"<style[\s\S]*?</style>", " ", text, flags=re.I)
+    text = re.sub(r"<[^>]+>", "\n", text)
+    lines = [_clean(html_module.unescape(line)) for line in text.splitlines()]
+    return [line for line in lines if line]
+
+
+def _label_next_map(lines: list[str], labels: tuple[str, ...]) -> dict[str, str]:
+    wanted = set(labels)
+    result: dict[str, str] = {}
+    for idx, line in enumerate(lines):
+        if line not in wanted or line in result or idx + 1 >= len(lines):
+            continue
+        value = lines[idx + 1]
+        if len(value) > 36 or re.search(r"照片|請洽|注意！|非物件|環境介紹|查看VR", value):
+            continue
+        result[line] = value
+    return result
+
+
+def _unique_urls(urls: list[str], limit: int = 16) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for url in urls:
+        url = html_module.unescape(_clean(url)).replace("&amp;", "&")
+        if not url or url in seen:
+            continue
+        if url.startswith("//"):
+            url = "https:" + url
+        seen.add(url)
+        out.append(url)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _price_to_wan(value) -> Optional[float]:
+    number = _to_float(value)
+    if number is None:
+        return None
+    if number >= 100000:
+        return round(number / 10000, 2)
+    return number
+
+
+def _looks_like_community_name(text: str) -> bool:
+    name = _clean(text or "")
+    if not name or name in ("實價登錄", "實價登錄3.0", "社區", "社區/商辦"):
+        return False
+    if name in LEJU_CITY_CODES or re.fullmatch(r".{1,3}[區鄉鎮市]", name):
+        return False
+    return True
+
+
+def _extract_js_object(html: str, marker: str) -> dict:
+    idx = html.find(marker)
+    if idx < 0:
+        return {}
+    start = html.find("{", idx)
+    if start < 0:
+        return {}
+    try:
+        obj, _ = json.JSONDecoder().raw_decode(html[start:])
+    except json.JSONDecodeError:
+        return {}
+    return obj if isinstance(obj, dict) else {}
+
+
+def _nuxt3_object(html: str, required: tuple[str, ...]) -> dict:
+    match = re.search(r'<script[^>]*id="__NUXT_DATA__"[^>]*>(.*?)</script>', html, re.S)
+    if not match:
+        return {}
+    try:
+        payload = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(payload, list):
+        return {}
+    mapping = next(
+        (
+            item
+            for item in payload
+            if isinstance(item, dict) and all(key in item for key in required)
+        ),
+        None,
+    )
+    if not mapping:
+        return {}
+    result = {}
+    for key, idx in mapping.items():
+        if isinstance(idx, int) and 0 <= idx < len(payload):
+            value = payload[idx]
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                result[key] = value
+        elif isinstance(idx, (str, int, float, bool)) or idx is None:
+            result[key] = idx
+    return result
+
+
+def _set_listing_parking(listing: PortalListing, text: str) -> None:
+    text = _clean(text or "")
+    if not text:
+        listing.parking_unknown = True
+        return
+    if text in ("--", "—", "-", "－", "無", "無車位"):
+        listing.parking_desc = "無車位"
+        listing.parking_unknown = False
+        return
+    listing.parking_desc = text
+    listing.parking_area = text
+    listing.parking_unknown = False
+
+
+def parse_sinyi_html(html: str, url: str) -> PortalListing:
+    listing_id = ""
+    match = re.search(r"/buy/house/([A-Za-z0-9]+)", url)
+    if match:
+        listing_id = match.group(1)
+    listing = PortalListing(source_name="信義房屋", listing_id=listing_id, source_url=url)
+    for item in _walk_jsonld(_jsonld_blocks(html)):
+        if item.get("@type") != "RealEstateListing":
+            continue
+        listing.title = _clean(item.get("name") or listing.title)
+        about = item.get("about") or {}
+        address = about.get("address") or {}
+        if isinstance(address, dict):
+            listing.listing_address = _clean(
+                "".join(
+                    [
+                        address.get("addressRegion") or "",
+                        address.get("addressLocality") or "",
+                        address.get("streetAddress") or "",
+                    ]
+                )
+            )
+        floor_size = about.get("floorSize") or {}
+        if isinstance(floor_size, dict) and floor_size.get("value"):
+            listing.registered = f"{floor_size['value']}坪"
+        for prop in about.get("additionalProperty") or []:
+            if prop.get("name") == "格局" and prop.get("value"):
+                listing.layout = _clean(str(prop["value"]))
+        offers = item.get("offers") or {}
+        listing.ask_price_wan = _price_to_wan(offers.get("price"))
+        if item.get("description"):
+            listing.remark = _clean(item.get("description"))
+        break
+
+    labels = _label_next_map(
+        _html_plain_lines(html),
+        ("屋齡", "樓層", "車位", "格局", "地址", "總價", "單價", "社區/商辦", "社區", "主建物", "公設比", "用途", "管理費"),
+    )
+    listing.house_age = labels.get("屋齡", listing.house_age)
+    listing.floor = labels.get("樓層", listing.floor)
+    listing.layout = labels.get("格局", listing.layout)
+    listing.listing_address = labels.get("地址", listing.listing_address)
+    listing.main_area = labels.get("主建物", listing.main_area)
+    listing.public_ratio = labels.get("公設比", listing.public_ratio)
+    listing.registered_use = labels.get("用途", listing.registered_use)
+    listing.management_fee = labels.get("管理費", listing.management_fee)
+    listing.ask_unit_price = labels.get("單價", listing.ask_unit_price)
+    if labels.get("總價") and listing.ask_price_wan is None:
+        listing.ask_price_wan = _price_to_wan(labels["總價"])
+    community = labels.get("社區/商辦") or labels.get("社區") or ""
+    if _looks_like_community_name(community):
+        listing.community_name = community
+
+    parking = labels.get("車位", "")
+    if parking in ("--", "—", "-", "無", "沒有"):
+        listing.parking_desc = "無車位"
+    elif parking:
+        listing.parking_desc = parking
+        listing.parking_area = parking
+    else:
+        listing.parking_unknown = True
+
+    listing.images = _unique_urls(
+        re.findall(r"https://res\.sinyi\.com\.tw/buy/[^\"'\s]+", html)
+    )
+    if listing_id and not listing.images:
+        listing.images = [f"https://res.sinyi.com.tw/buy/{listing_id}/bigimg/A.JPG"]
+    if listing.ask_price_wan and listing.registered and not listing.ask_unit_price:
+        ping = _to_float(listing.registered)
+        if ping:
+            listing.ask_unit_price = f"{round(listing.ask_price_wan / ping, 2)}萬/坪"
+    return listing
+
+
+def parse_yungching_html(html: str, url: str) -> PortalListing:
+    listing_id = ""
+    match = re.search(r"/house/(\d+)", url)
+    if match:
+        listing_id = match.group(1)
+    listing = PortalListing(source_name="永慶房屋", listing_id=listing_id, source_url=url)
+
+    pairs = {}
+    for match in re.finditer(
+        r'class="item-title[^"]*"[^>]*>\s*(?:<h4[^>]*>)?([^<]+)(?:</h4>)?.*?</div>\s*'
+        r'<div[^>]*class="item-detail"[^>]*>(.*?)</div>',
+        html,
+        re.S,
+    ):
+        key = _clean(match.group(1)).lstrip("・")
+        value = _clean(re.sub(r"<[^>]+>", " ", match.group(2)))
+        if key and value:
+            pairs[key] = value
+
+    listing.layout = pairs.get("建物格局", listing.layout)
+    listing.registered = pairs.get("建物坪數", listing.registered)
+    listing.main_area = pairs.get("主建物", listing.main_area)
+    listing.registered_use = pairs.get("謄本用途", listing.registered_use)
+    listing.ask_unit_price = pairs.get("單價", listing.ask_unit_price)
+    if listing.ask_unit_price:
+        listing.ask_unit_price = re.sub(r"\s*問行情.*$", "", listing.ask_unit_price).strip()
+    if pairs.get("車位"):
+        listing.parking_desc = pairs["車位"]
+        listing.parking_area = pairs["車位"]
+    else:
+        listing.parking_unknown = True
+
+    plain = "\n".join(_html_plain_lines(html))
+    age = re.search(r"屋齡\s*([\d.]+)\s*年", plain)
+    if age:
+        listing.house_age = f"{age.group(1)}年"
+    floor = re.search(r"(\d+\s*[~～\-]\s*\d+\s*/\s*\d+\s*樓)|(\d+\s*/\s*\d+\s*樓)", plain)
+    if floor:
+        listing.floor = _clean(floor.group(0))
+    area = re.search(r"建物\s*([\d.]+)\s*坪", plain)
+    if area and not listing.registered:
+        listing.registered = f"{area.group(1)}坪"
+
+    for item in _walk_jsonld(_jsonld_blocks(html)):
+        if item.get("@type") == "Product":
+            name = _clean(item.get("name") or "")
+            listing.title = name.split("|")[0].strip() or listing.title
+            listing.ask_price_wan = _price_to_wan(item.get("offers", {}).get("price"))
+            image = item.get("image")
+            if isinstance(image, str):
+                listing.images.append(image)
+            elif isinstance(image, list):
+                listing.images.extend(str(x) for x in image if x)
+            if item.get("description"):
+                listing.remark = _clean(item.get("description"))
+        if item.get("@type") == "BreadcrumbList":
+            crumbs = [(_clean(x.get("name") or "")) for x in item.get("itemListElement") or []]
+            crumbs = [c for c in crumbs if c and c != "買屋"]
+            if len(crumbs) >= 3:
+                listing.listing_address = listing.listing_address or "".join(crumbs[:3])
+
+    listing.images.extend(re.findall(r"https://yccdn\.yungching\.com\.tw/[^\"'\s]+", html))
+    listing.images = _unique_urls(listing.images)
+    if not listing.title:
+        title = re.search(r"<title>([^<]+)</title>", html)
+        if title:
+            listing.title = _clean(title.group(1)).split("|")[0]
+    return listing
+
+
+def parse_rakuya_html(html: str, url: str) -> PortalListing:
+    info = _extract_js_object(html, "window.itemInfo")
+    parsed = urlparse(url)
+    ehid = urllib.parse.parse_qs(parsed.query).get("ehid", [""])[0]
+    listing = PortalListing(source_name="樂屋網", listing_id=ehid, source_url=url)
+    if not info:
+        raise ValueError("樂屋物件資料讀取失敗，請確認網址是否仍有效。")
+
+    title = info.get("title") or {}
+    price = info.get("price") or {}
+    detail = info.get("detail") or {}
+    special = info.get("special") or {}
+    images = info.get("images") or {}
+
+    listing.title = _clean(title.get("hname") or "")
+    listing.community_name = _clean(title.get("community") or "")
+    listing.listing_address = _clean(title.get("address") or "")
+    listing.ask_price_wan = _price_to_wan(price.get("price"))
+    if price.get("singlePrice"):
+        listing.ask_unit_price = f"{price['singlePrice']}萬/坪"
+    if price.get("totalsize"):
+        listing.registered = f"{price['totalsize']}坪"
+    listing.main_area = _clean(detail.get("mainSize") or "")
+    listing.parking_desc = _clean(detail.get("parking") or "")
+    listing.parking_area = _clean(detail.get("parkingSize") or "")
+    listing.parking_unknown = not listing.parking_desc and not listing.parking_area
+    listing.registered_use = _clean(detail.get("itemUseType") or detail.get("propertyUsecode") or "")
+    listing.listing_id = _clean(detail.get("ehid") or ehid)
+    age_value = detail.get("ageValue")
+    if age_value not in (None, ""):
+        listing.house_age = f"{age_value}{detail.get('ageUnit') or '年'}"
+    trans_floors = _clean(str(detail.get("transFloors") or ""))
+    max_floors = _clean(str(detail.get("maxFloors") or ""))
+    if trans_floors and max_floors:
+        listing.floor = f"{trans_floors}F/{max_floors}F"
+    beds = detail.get("patternBedrooms")
+    lives = detail.get("patternLivingrooms")
+    baths = detail.get("patternBathrooms")
+    if beds is not None:
+        listing.layout = f"{beds}房{lives or 0}廳{baths or 0}衛"
+    listing.remark = _clean(re.sub(r"<br\s*/?>", "\n", str(special.get("description") or "")))
+    listing.management_fee = _clean(detail.get("manageFee") or "")
+    photos = []
+    for photo in images.get("photo") or []:
+        if isinstance(photo, dict) and photo.get("url") and not photo.get("isDefaultImage"):
+            photos.append(photo["url"])
+    listing.images = _unique_urls(photos)
+    nearby = info.get("nearby") or {}
+    cover = nearby.get("cover")
+    if cover and not listing.images:
+        listing.images = _unique_urls([cover])
+    return listing
+
+
+def analyze_sinyi(url: str) -> AnalysisReport:
+    match = re.search(r"/buy/house/([A-Za-z0-9]+)", url)
+    if not match:
+        raise ValueError("這不是有效的信義房屋物件網址。")
+    listing_id = match.group(1)
+    page_url = f"https://www.sinyi.com.tw/buy/house/{listing_id}"
+    html = _fetch_page(page_url, "https://www.sinyi.com.tw/")
+    listing = parse_sinyi_html(html, page_url)
+    if not listing.title and not listing.registered:
+        raise ValueError("信義房屋物件資料讀取失敗，請確認網址是否仍有效。")
+    return analyze_portal_listing(listing)
+
+
+def analyze_yungching(url: str) -> AnalysisReport:
+    match = re.search(r"/house/(\d+)", url)
+    if not match:
+        raise ValueError("這不是有效的永慶房屋物件網址。")
+    listing_id = match.group(1)
+    page_url = f"https://buy.yungching.com.tw/house/{listing_id}"
+    html = _fetch_page(page_url, "https://buy.yungching.com.tw/")
+    listing = parse_yungching_html(html, page_url)
+    if not listing.title and not listing.registered:
+        raise ValueError("永慶房屋物件資料讀取失敗，請確認網址是否仍有效。")
+    return analyze_portal_listing(listing)
+
+
+def analyze_rakuya(url: str) -> AnalysisReport:
+    parsed = urlparse(url)
+    ehid = urllib.parse.parse_qs(parsed.query).get("ehid", [""])[0]
+    if not ehid:
+        match = re.search(r"ehid=([A-Za-z0-9]+)", url)
+        ehid = match.group(1) if match else ""
+    if not ehid:
+        raise ValueError("這不是有效的樂屋物件網址（網址需包含 ehid）。")
+    page_url = f"https://www.rakuya.com.tw/sell_item/info?ehid={ehid}"
+    html = _fetch_impersonated(page_url)
+    listing = parse_rakuya_html(html, page_url)
+    return analyze_portal_listing(listing)
+
+
+def parse_hbhousing_html(html: str, url: str) -> PortalListing:
+    data = _nuxt3_object(html, ("sn", "price", "area"))
+    sn = _clean(str(data.get("sn") or ""))
+    if not sn:
+        match = re.search(r"[?&]sn=([A-Za-z0-9]+)", url)
+        sn = match.group(1) if match else ""
+    listing = PortalListing(source_name="住商不動產", listing_id=sn, source_url=url)
+    listing.title = _clean(str(data.get("objName") or ""))
+    listing.ask_price_wan = _price_to_wan(data.get("price"))
+    if data.get("uprice"):
+        listing.ask_unit_price = f"{data['uprice']}萬/坪"
+    if data.get("area"):
+        listing.registered = f"{data['area']}坪"
+    if data.get("mainArea"):
+        listing.main_area = f"{data['mainArea']}坪"
+    if data.get("age") not in (None, ""):
+        listing.house_age = f"{data['age']}年"
+    floor = _clean(str(data.get("floor") or ""))
+    total = _clean(str(data.get("floorTotal") or ""))
+    if floor and total:
+        listing.floor = f"{floor}F/{total}F"
+    listing.registered_use = _clean(str(data.get("type") or ""))
+    rooms, halls, baths = data.get("room"), data.get("hall"), data.get("bath")
+    special = _clean(str(data.get("special") or ""))
+    if special and "房" in special and "--房" not in special:
+        listing.layout = special
+    elif rooms not in (None, 0) or baths not in (None, 0):
+        listing.layout = f"{rooms or 0}房{halls or 0}廳{baths or 0}衛"
+    city = _clean(str(data.get("city") or ""))
+    district = _clean(str(data.get("district") or ""))
+    road = _clean(str(data.get("road") or data.get("doorplate") or ""))
+    listing.listing_address = _clean(f"{city}{district}{road}")
+    community = _clean(str(data.get("community") or ""))
+    if _looks_like_community_name(community) and community not in ("--", "-"):
+        listing.community_name = community
+    _set_listing_parking(listing, str(data.get("parking") or ""))
+    listing.lat = _to_float(data.get("lat"))
+    listing.lon = _to_float(data.get("lon"))
+    listing.remark = " ".join(
+        _clean(str(data.get(f"emphasis{i}") or "")) for i in range(1, 6)
+    ).strip()
+    if data.get("manageFee"):
+        listing.management_fee = str(data.get("manageFee"))
+    photos = [str(data.get(f"photo{i}") or "") for i in range(1, 21)]
+    listing.images = _unique_urls(photos)
+    return listing
+
+
+def parse_twhg_html(html: str, url: str) -> PortalListing:
+    listing_id = ""
+    match = re.search(r"/buy/([A-Za-z]{2}\d+)", url)
+    if match:
+        listing_id = match.group(1)
+    listing = PortalListing(source_name="台灣房屋", listing_id=listing_id, source_url=url)
+    labels = _label_next_map(
+        _html_plain_lines(html),
+        ("屋齡", "樓層", "建坪", "主建物", "格局", "地址", "社區", "車位", "單價", "類型", "用途", "管理費"),
+    )
+    listing.house_age = labels.get("屋齡", "")
+    listing.floor = labels.get("樓層", "")
+    listing.registered = labels.get("建坪", "")
+    listing.main_area = labels.get("主建物", "")
+    listing.layout = labels.get("格局", "")
+    listing.listing_address = labels.get("地址", "")
+    listing.ask_unit_price = labels.get("單價", "")
+    listing.registered_use = labels.get("用途") or labels.get("類型", "")
+    listing.management_fee = labels.get("管理費", "")
+    community = labels.get("社區", "")
+    if _looks_like_community_name(community) and community not in ("-", "--"):
+        listing.community_name = community
+    _set_listing_parking(listing, labels.get("車位", ""))
+    title = re.search(r"<h1[^>]*>([^<]+)</h1>", html, re.I)
+    if title:
+        listing.title = _clean(re.sub(r"\s*\([A-Z]{2}\d+\)\s*$", "", title.group(1)))
+    if not listing.title:
+        tag = re.search(r"<title>([^<]+)</title>", html, re.I)
+        if tag:
+            listing.title = _clean(tag.group(1)).split("｜")[0]
+    plain = "\n".join(_html_plain_lines(html))
+    price = re.search(r"([1-9][\d,]{2,6})\s*萬(?!/坪)", plain)
+    if price:
+        listing.ask_price_wan = _price_to_wan(price.group(1))
+    listing.images = _unique_urls(re.findall(r"https://img\.twhg\.com\.tw/admin/[^\"'\s]+", html))
+    listing.remark = _clean((re.search(r'<meta name="description" content="([^"]*)"', html, re.I) or [None, ""])[1])
+    return listing
+
+
+def parse_housefun_html(html: str, url: str) -> PortalListing:
+    listing_id = ""
+    match = re.search(r"/buy/house/(\d+)", url)
+    if match:
+        listing_id = match.group(1)
+    listing = PortalListing(source_name="好房網", listing_id=listing_id, source_url=url)
+    props = {}
+    for item in _walk_jsonld(_jsonld_blocks(html)):
+        if item.get("@type") == "Residence":
+            address = item.get("address") or {}
+            if isinstance(address, dict):
+                listing.listing_address = _clean(
+                    address.get("streetAddress") or address.get("addressLocality") or ""
+                )
+            for prop in item.get("additionalProperty") or []:
+                name = _clean(str(prop.get("name") or ""))
+                value = prop.get("value")
+                if isinstance(value, dict):
+                    value = value.get("value")
+                props[name] = _clean(str(value or ""))
+        if item.get("@type") == "Product":
+            listing.title = _clean(item.get("name") or listing.title)
+            listing.remark = _clean(item.get("description") or listing.remark)
+            offers = item.get("offers") or {}
+            listing.ask_price_wan = _price_to_wan(offers.get("price"))
+            image = item.get("image")
+            if isinstance(image, list):
+                listing.images.extend(str(x) for x in image if x)
+            elif isinstance(image, str):
+                listing.images.append(image)
+    if props.get("floorSize"):
+        listing.registered = props["floorSize"] if "坪" in props["floorSize"] else f"{props['floorSize']}坪"
+    beds, lives, baths = props.get("numberOfRooms"), props.get("numberOfLivingRoomTotal"), props.get("numberOfBathRoomsTotal")
+    if beds:
+        listing.layout = f"{beds}房{lives or 0}廳{baths or 0}衛"
+    if props.get("yearBuilt"):
+        listing.house_age = f"{props['yearBuilt']}年"
+    listing.registered_use = props.get("caseType", "")
+    community = props.get("community", "")
+    if _looks_like_community_name(community):
+        listing.community_name = community
+    _set_listing_parking(listing, props.get("parking", ""))
+    labels = _label_next_map(
+        _html_plain_lines(html),
+        ("屋齡", "樓層", "單價", "房屋格局", "建物坪數", "管理費"),
+    )
+    listing.floor = labels.get("樓層", listing.floor)
+    listing.ask_unit_price = labels.get("單價", listing.ask_unit_price)
+    if labels.get("房屋格局"):
+        listing.layout = labels["房屋格局"]
+    floor_m = re.search(r"(\d+\s*/\s*\d+\s*樓)", listing.remark or "")
+    if floor_m and not listing.floor:
+        listing.floor = _clean(floor_m.group(1))
+    main = re.search(r"主\+陽[：:]\s*([\d.]+)\s*坪", " ".join(_html_plain_lines(html)))
+    if main:
+        listing.main_area = f"{main.group(1)}坪"
+    listing.images = _unique_urls(listing.images)
+    return listing
+
+
+def parse_etwarm_html(html: str, url: str) -> PortalListing:
+    listing_id = ""
+    match = re.search(r"/houses/buy/(\d+)", url)
+    if match:
+        listing_id = match.group(1)
+    listing = PortalListing(source_name="東森房屋", listing_id=listing_id, source_url=url)
+    labels = _label_next_map(
+        _html_plain_lines(html),
+        ("物件編號", "總價", "地址", "類型", "格局", "樓層", "屋齡", "管理費", "車位", "社區", "建物總坪數", "主建物+附屬建物"),
+    )
+    listing.title = _clean((re.search(r"<title>([^<]+)</title>", html, re.I) or [None, ""])[1]).split(" - ")[0]
+    listing.ask_price_wan = _price_to_wan(labels.get("總價"))
+    listing.listing_address = labels.get("地址", "")
+    listing.layout = labels.get("格局", "").replace(" ", "")
+    listing.floor = labels.get("樓層", "").replace(" ", "")
+    listing.house_age = labels.get("屋齡", "")
+    listing.management_fee = labels.get("管理費", "")
+    listing.registered = labels.get("建物總坪數", "")
+    listing.main_area = labels.get("主建物+附屬建物", "")
+    listing.registered_use = labels.get("類型", "")
+    community = labels.get("社區", "")
+    if _looks_like_community_name(community) and community not in ("－", "-", "--"):
+        listing.community_name = community
+    _set_listing_parking(listing, labels.get("車位", ""))
+    listing.images = _unique_urls(
+        re.findall(r"https://[^\"'\s]+\.(?:jpg|jpeg|png|JPG|JPEG)", html)
+    )
+    listing.remark = _clean((re.search(r'<meta name="description" content="([^"]*)"', html, re.I) or [None, ""])[1])
+    unit = re.search(r"([\d.]+)\s*萬/坪", " ".join(_html_plain_lines(html)))
+    if unit:
+        listing.ask_unit_price = f"{unit.group(1)}萬/坪"
+    return listing
+
+
+def analyze_hbhousing(url: str) -> AnalysisReport:
+    match = re.search(r"[?&]sn=([A-Za-z0-9]+)", url) or re.search(r"/detail/([A-Za-z0-9]+)", url)
+    if not match:
+        raise ValueError("這不是有效的住商不動產物件網址。")
+    sn = match.group(1)
+    page_url = f"https://www.hbhousing.com.tw/detail?sn={sn}"
+    html = _fetch_page(page_url, "https://www.hbhousing.com.tw/")
+    listing = parse_hbhousing_html(html, page_url)
+    if not listing.title and not listing.registered:
+        raise ValueError("住商物件資料讀取失敗，請確認網址是否仍有效。")
+    return analyze_portal_listing(listing)
+
+
+def analyze_twhg(url: str) -> AnalysisReport:
+    match = re.search(r"/buy/([A-Za-z]{2}\d+)", url)
+    if not match:
+        raise ValueError("這不是有效的台灣房屋物件網址。")
+    page_url = f"https://www.twhg.com.tw/buy/{match.group(1)}"
+    html = _fetch_page(page_url, "https://www.twhg.com.tw/")
+    listing = parse_twhg_html(html, page_url)
+    if not listing.title and not listing.registered:
+        raise ValueError("台灣房屋物件資料讀取失敗，請確認網址是否仍有效。")
+    return analyze_portal_listing(listing)
+
+
+def analyze_housefun(url: str) -> AnalysisReport:
+    match = re.search(r"/buy/house/(\d+)", url)
+    if not match:
+        raise ValueError("這不是有效的好房網物件網址。")
+    page_url = f"https://buy.housefun.com.tw/buy/house/{match.group(1)}"
+    html = _fetch_page(page_url, "https://buy.housefun.com.tw/")
+    listing = parse_housefun_html(html, page_url)
+    if not listing.title and not listing.registered:
+        raise ValueError("好房網物件資料讀取失敗，請確認網址是否仍有效。")
+    return analyze_portal_listing(listing)
+
+
+def analyze_etwarm(url: str) -> AnalysisReport:
+    match = re.search(r"/houses/buy/(\d+)", url)
+    if not match:
+        raise ValueError("這不是有效的東森房屋物件網址。")
+    page_url = f"https://www.etwarm.com.tw/houses/buy/{match.group(1)}"
+    html = _fetch_page(page_url, "https://www.etwarm.com.tw/")
+    listing = parse_etwarm_html(html, page_url)
+    if not listing.title and not listing.registered:
+        raise ValueError("東森房屋物件資料讀取失敗，請確認網址是否仍有效。")
+    return analyze_portal_listing(listing)
+
+
+def analyze_portal_listing(listing: PortalListing) -> AnalysisReport:
+    """信義／永慶／樂屋物件共用：社區補樂居、行情走實價登錄。"""
+    sources = [f"{listing.source_name}物件頁：{listing.source_url}"]
+    listing_address = listing.listing_address or UNKNOWN
+    community_address = listing_address if listing_address != UNKNOWN else ""
+
+    api_key = _google_maps_api_key()
+    nearby_lat, nearby_lon = listing.lat, listing.lon
+    if (not nearby_lat or not nearby_lon) and api_key and community_address:
+        nearby_lat, nearby_lon = geocode_google(community_address, api_key)
+    nearest_mrt, nearest_shop = UNKNOWN, UNKNOWN
+    if nearby_lat and nearby_lon:
+        nearest_mrt, nearest_shop = fetch_nearby_cached(nearby_lat, nearby_lon, api_key=api_key)
+        sources.append("Google Maps 周邊設施（步行距離）" if api_key else "OpenStreetMap 周邊設施")
+
+    registered = listing.registered
+    main_area = listing.main_area
+    if listing.parking_unknown:
+        parking_area, parking_status, parking_bundled = None, UNKNOWN, False
+        has_parking = None
+    else:
+        parking_area, parking_status, parking_bundled = _parse_parking_info(
+            {"車位面積": listing.parking_area, "登記總面積": registered},
+            {"parking": listing.parking_desc, "unitArea": registered},
+        )
+        has_parking = parking_status != "無"
+
+    public_ratio = listing.public_ratio or UNKNOWN
+    house_age = _or_unknown(listing.house_age)
+    floor_text = _or_unknown(listing.floor)
+
+    leju = {}
+    if listing.community_name:
+        leju = fetch_leju_community(listing.community_name, community_address, listing_address)
+    fields_591 = {
+        "community_name": listing.community_name,
+        "land_area": "",
+        "household_count": "",
+        "building_floors": "",
+        "public_ratio": public_ratio if public_ratio != UNKNOWN else "",
+        "community_address": community_address,
+    }
+    report_fields = merge_community_fields(fields_591, leju, sources)
+    if parking_bundled:
+        report_fields["public_ratio"] = _annotate_public_ratio(report_fields["public_ratio"], True)
+
+    want = _split_tw_address(report_fields["community_address"], community_address, listing_address)
+    door_numbers = {
+        number
+        for addr in (report_fields["community_address"], community_address, listing_address, leju.get("address", ""))
+        if addr and addr != UNKNOWN
+        for number in [plvr.door_number(addr)]
+        if number
+    }
+    registered_ping = _to_float(registered)
+    market = estimate_market_from_plvr(
+        want,
+        door_numbers,
+        registered_ping,
+        parking_area,
+        listing.parking_desc,
+        report_fields["building_floors"],
+        house_age,
+        floor_text,
+        sources,
+        parking_bundled=parking_bundled,
+    )
+    unit_range, total_range, comment = market.unit_price_range, market.total_price_range, market.comment
+    previous_sale = market.previous_sale
+    if not market.ok:
+        unit_range, total_range, comment = UNKNOWN, UNKNOWN, "此來源沒有 591 社區成交可備援，且實價登錄樣本不足，暫無法估價。"
+
+    bathroom_window = detect_bathroom_window(listing.remark, listing.title)
+    lighting_faces = analyze_lighting_faces(listing.remark, listing.title, listing.images)
+    ask_unit = listing.ask_unit_price
+    if ask_unit and "萬" not in ask_unit and re.search(r"[\d.]+", ask_unit):
+        ask_unit = f"{ask_unit}萬/坪"
+
+    pros, cons = build_pros_cons(
+        house_age=house_age,
+        public_ratio=report_fields["public_ratio"],
+        nearest_mrt=nearest_mrt,
+        nearest_supermarket=nearest_shop,
+        registered_ping=registered_ping,
+        main_ping=_to_float(main_area),
+        parking_ping=parking_area,
+        floor=floor_text,
+        management_fee=listing.management_fee,
+        bathroom_window=bathroom_window,
+        lighting_faces=lighting_faces,
+        market_comment=comment,
+        household_count=report_fields["household_count"],
+        has_parking=has_parking,
+        parking_bundled=parking_bundled,
+    )
+
+    return AnalysisReport(
+        title=_or_unknown(listing.title),
+        listing_id=listing.listing_id,
+        source_url=listing.source_url,
+        image_url="",
+        ask_price_wan=listing.ask_price_wan,
+        ask_unit_price=_or_unknown(ask_unit),
+        layout=_or_unknown(listing.layout),
+        community_name=report_fields["community_name"],
+        land_area=report_fields["land_area"],
+        household_count=report_fields["household_count"],
+        building_floors=report_fields["building_floors"],
+        public_ratio=report_fields["public_ratio"],
+        community_address=report_fields["community_address"],
+        listing_address=_or_unknown(listing_address),
+        nearest_mrt=_or_unknown(nearest_mrt),
+        nearest_supermarket=_or_unknown(nearest_shop),
+        registered_area=_format_registered_area(
+            registered,
+            parking_area,
+            has_parking=has_parking is True,
+            bundled=parking_bundled,
+            parking_unknown=has_parking is None,
+        ),
+        parking_status=parking_status,
+        house_age=house_age,
+        main_building_area=_or_unknown(main_area),
+        registered_use=_or_unknown(listing.registered_use),
+        floor=floor_text,
+        bathroom_window=bathroom_window,
+        lighting_faces=lighting_faces,
+        unit_price_range=_or_unknown(unit_range),
+        total_price_range=_or_unknown(total_range),
+        market_comment=_or_unknown(comment),
+        previous_sale=previous_sale,
+        building_deals=market.building_deals,
+        building_deal_scope=market.building_scope,
+        interior_images=listing.images[:16],
+        community_images=[],
+        latitude=nearby_lat,
+        longitude=nearby_lon,
+        pros=pros,
+        cons=cons,
+        deals=[],
+        sources=sources,
+    )
+
+
 def analyze_url(url: str) -> AnalysisReport:
     text = (url or "").strip()
     if re.fullmatch(r"\d{6,}", text):
@@ -2067,5 +3042,20 @@ def analyze_url(url: str) -> AnalysisReport:
     if "leju.com.tw" in host and "/community/" in text:
         return analyze_leju_community_url(text)
     if "rakuya.com.tw" in host:
-        raise ValueError("樂屋網址尚不支援。請改貼 591 售屋網址（電腦版、手機版或物件編號都可以），系統會自動去樂居與實價登錄補資料。")
-    raise ValueError("目前請貼上 591 售屋網址（電腦版、手機版或物件編號都可以）。樂居社區頁也可以，但沒有單一戶的開價與權狀。")
+        return analyze_rakuya(text)
+    if "sinyi.com.tw" in host:
+        return analyze_sinyi(text)
+    if "yungching.com.tw" in host:
+        return analyze_yungching(text)
+    if "hbhousing.com.tw" in host:
+        return analyze_hbhousing(text)
+    if "twhg.com.tw" in host:
+        return analyze_twhg(text)
+    if "housefun.com.tw" in host:
+        return analyze_housefun(text)
+    if "etwarm.com.tw" in host:
+        return analyze_etwarm(text)
+    raise ValueError(
+        "請貼上房屋物件網址：591、樂屋、信義、永慶、住商、台灣房屋、好房網或東森。"
+        "591 也可以只貼物件編號。樂居社區頁也可以，但沒有單一戶的開價與權狀。"
+    )
