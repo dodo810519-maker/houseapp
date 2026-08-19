@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 實價登錄季檔可重新下載，不需要進版控
+plvr_cache/
+nearby_cache.json
+
+# API 金鑰
+.streamlit/secrets.toml
+.env
+.env.*

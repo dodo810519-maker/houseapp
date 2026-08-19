@@ -1,0 +1,447 @@
+import html
+import os
+import re
+import urllib.parse
+
+import streamlit as st
+import streamlit.components.v1 as components
+
+from scraper import AnalysisReport, analyze_url
+
+try:
+    google_key = st.secrets.get("GOOGLE_MAPS_API_KEY", "")
+    if google_key:
+        os.environ["GOOGLE_MAPS_API_KEY"] = google_key
+except Exception:
+    pass
+
+st.set_page_config(
+    page_title="房產分析助手",
+    page_icon="🏠",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
+
+st.markdown(
+    """
+<style>
+    @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;500;700&display=swap');
+
+    html, body, [class*="css"] {
+        font-family: 'Noto Sans TC', sans-serif;
+    }
+
+    .block-container {
+        padding-top: 0.5rem;
+        max-width: 1200px;
+    }
+
+    div[data-testid="stVerticalBlock"]:has(.sticky-header) {
+        position: sticky;
+        top: 0;
+        z-index: 999;
+        background: rgba(255, 255, 255, 0.97);
+        backdrop-filter: blur(10px);
+        padding: 0.75rem 0 0.9rem 0;
+        margin: 0 -1rem;
+        padding-left: 1rem;
+        padding-right: 1rem;
+        border-bottom: 1px solid #e2e8f0;
+        box-shadow: 0 6px 24px rgba(15, 23, 42, 0.07);
+    }
+
+    .sticky-title {
+        font-size: 1.05rem;
+        font-weight: 700;
+        color: #0f172a;
+        margin: 0 0 0.55rem 0;
+    }
+
+    .section-card {
+        background: #f8fafc;
+        border: 1px solid #e2e8f0;
+        border-radius: 14px;
+        padding: 1.1rem 1.3rem;
+        margin-bottom: 1rem;
+    }
+
+    .section-title {
+        font-size: 1.15rem;
+        font-weight: 700;
+        color: #0f172a;
+        margin-bottom: 0.8rem;
+        padding-bottom: 0.5rem;
+        border-bottom: 2px solid #14b8a6;
+        display: inline-block;
+    }
+
+    .field-label {
+        font-size: 0.78rem;
+        font-weight: 600;
+        color: #64748b;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        margin-bottom: 0.15rem;
+    }
+
+    .field-value {
+        font-size: 0.98rem;
+        color: #0f172a;
+        margin-bottom: 0.75rem;
+        line-height: 1.5;
+    }
+
+    .pro-item {
+        background: #ecfdf5;
+        border-left: 4px solid #10b981;
+        padding: 0.65rem 0.85rem;
+        border-radius: 8px;
+        margin-bottom: 0.5rem;
+        color: #065f46;
+        font-size: 0.92rem;
+    }
+
+    .con-item {
+        background: #fff7ed;
+        border-left: 4px solid #f59e0b;
+        padding: 0.65rem 0.85rem;
+        border-radius: 8px;
+        margin-bottom: 0.5rem;
+        color: #92400e;
+        font-size: 0.92rem;
+    }
+
+    .photo-caption {
+        font-size: 0.82rem;
+        color: #64748b;
+        margin-top: -0.35rem;
+        margin-bottom: 0.75rem;
+    }
+
+    div[data-testid="stRadio"] > div {
+        background: #f1f5f9;
+        padding: 0.35rem;
+        border-radius: 10px;
+        gap: 0.25rem;
+    }
+
+    .stButton > button[kind="primary"] {
+        background: linear-gradient(135deg, #0d9488, #0891b2);
+        border: none;
+        border-radius: 10px;
+        font-weight: 600;
+    }
+
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+    header {visibility: hidden;}
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
+if "single_url" not in st.session_state:
+    st.session_state.single_url = ""
+if "compare_urls" not in st.session_state:
+    st.session_state.compare_urls = ""
+if "single_report" not in st.session_state:
+    st.session_state.single_report = None
+if "compare_reports" not in st.session_state:
+    st.session_state.compare_reports = None
+
+
+def clear_single_url() -> None:
+    st.session_state.single_url = ""
+
+
+def clear_compare_urls() -> None:
+    st.session_state.compare_urls = ""
+
+
+def show_field(label: str, value: str) -> None:
+    safe_value = html.escape(value or "查無資料")
+    st.markdown(f'<div class="field-label">{label}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="field-value">{safe_value}</div>', unsafe_allow_html=True)
+
+
+def section_header(title: str) -> None:
+    st.markdown(f'<div class="section-title">{title}</div>', unsafe_allow_html=True)
+
+
+def _render_price_gap(report: AnalysisReport) -> None:
+    """把開價放到合理區間與前次成交價旁邊，讓議價空間一眼看得出來。"""
+    ask = report.ask_price_wan
+    if not ask:
+        return
+
+    cols = st.columns(3)
+    cols[0].metric("開價", f"{ask:,.0f} 萬")
+
+    upper = re.search(r"～\s*([\d,]+)\s*萬", report.total_price_range or "")
+    if upper:
+        top = float(upper.group(1).replace(",", ""))
+        cols[1].metric("較合理區間上緣", f"{ask - top:+,.0f} 萬", delta=f"{(ask / top - 1) * 100:+.1f}%")
+
+    previous = re.search(r"以\s*([\d,]+)\s*萬成交", getattr(report, "previous_sale", "") or "")
+    if previous:
+        before = float(previous.group(1).replace(",", ""))
+        cols[2].metric("較前次成交", f"{ask - before:+,.0f} 萬", delta=f"{(ask / before - 1) * 100:+.1f}%")
+
+
+def render_photo_grid(images: list[str], columns: int = 3, max_images: int = 9) -> None:
+    if not images:
+        st.caption("查無照片")
+        return
+    cols = st.columns(columns)
+    for idx, url in enumerate(images[:max_images]):
+        with cols[idx % columns]:
+            st.image(url, use_container_width=True)
+
+
+def render_google_map(report: AnalysisReport) -> None:
+    map_address = report.community_address
+    if not map_address or map_address == "查無資料":
+        st.caption("無法取得社區登記地址，無法顯示地圖。")
+        return
+
+    display_addr = map_address.split("（")[0].strip()
+    st.markdown(f"**{html.escape(display_addr)}**")
+    query = display_addr
+
+    map_url = (
+        "https://maps.google.com/maps?"
+        f"q={urllib.parse.quote(query)}&hl=zh-TW&z=16&output=embed"
+    )
+    components.html(
+        f"""
+        <iframe
+            src="{html.escape(map_url)}"
+            width="100%"
+            height="420"
+            style="border:0;border-radius:14px;"
+            allowfullscreen=""
+            loading="lazy"
+            referrerpolicy="no-referrer-when-downgrade">
+        </iframe>
+        """,
+        height=440,
+    )
+    maps_link = f"https://www.google.com/maps/search/?api=1&query={urllib.parse.quote(query)}"
+    st.markdown(f"[在 Google 地圖中開啟]({maps_link})")
+
+
+def render_report(report: AnalysisReport, show_market: bool = True, compact: bool = False) -> None:
+    st.markdown('<div class="section-card">', unsafe_allow_html=True)
+    section_header("1. 社區環境")
+    c1, c2 = st.columns(2)
+    with c1:
+        show_field("(1) 社區名稱", report.community_name)
+        show_field("(2) 基地面積", report.land_area)
+        show_field("(3) 總戶數", report.household_count)
+        show_field("(4) 總樓高", report.building_floors)
+    with c2:
+        show_field("(5) 公設比", report.public_ratio)
+        show_field("(6) 社區地址", report.community_address)
+        show_field("(7) 最近捷運站", report.nearest_mrt)
+        show_field("(8) 最近超市", report.nearest_supermarket)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown('<div class="section-card">', unsafe_allow_html=True)
+    section_header("2. 本戶條件")
+    h1, h2 = st.columns(2)
+    with h1:
+        show_field("(1) 權狀面積", report.registered_area)
+        show_field("(2) 有無車位", getattr(report, "parking_status", "無"))
+        show_field("(3) 屋齡", report.house_age)
+        show_field("(4) 主建物面積", report.main_building_area)
+    with h2:
+        show_field("(5) 登記用途", report.registered_use)
+        show_field("(6) 樓層", report.floor)
+        show_field("(7) 廁所是否有對外窗", report.bathroom_window)
+        show_field("(8) 有幾面採光", report.lighting_faces)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown('<div class="section-card">', unsafe_allow_html=True)
+    section_header("3. 優缺點分析")
+    p1, p2 = st.columns(2)
+    with p1:
+        st.markdown("**優點**")
+        for item in report.pros:
+            st.markdown(f'<div class="pro-item">{html.escape(item)}</div>', unsafe_allow_html=True)
+    with p2:
+        st.markdown("**缺點**")
+        for item in report.cons:
+            st.markdown(f'<div class="con-item">{html.escape(item)}</div>', unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    if show_market:
+        st.markdown('<div class="section-card">', unsafe_allow_html=True)
+        section_header("4. 市場行情")
+        show_field("合理單價區間（不含車位）", report.unit_price_range)
+        show_field("合理總價區間（含車位）", report.total_price_range)
+        show_field("本戶前次成交", getattr(report, "previous_sale", "查無資料"))
+        _render_price_gap(report)
+        st.info(report.market_comment)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    photo_cols = 2 if compact else 3
+    photo_max = 4 if compact else 9
+
+    st.markdown('<div class="section-card">', unsafe_allow_html=True)
+    section_header("5. 房屋內部照片")
+    st.markdown('<div class="photo-caption">來自本戶刊登照片</div>', unsafe_allow_html=True)
+    render_photo_grid(report.interior_images, columns=photo_cols, max_images=photo_max)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown('<div class="section-card">', unsafe_allow_html=True)
+    section_header("6. 社區公共空間")
+    st.markdown('<div class="photo-caption">外觀、環境、公設等社區照片</div>', unsafe_allow_html=True)
+    render_photo_grid(report.community_images, columns=photo_cols, max_images=photo_max)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown('<div class="section-card">', unsafe_allow_html=True)
+    section_header("7. 位置地圖")
+    render_google_map(report)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    if not compact:
+        with st.expander("物件編號與資料來源"):
+            st.write(f"編號：{report.listing_id}")
+            for source in report.sources:
+                st.write(source)
+
+
+def parse_urls(raw: str) -> list[str]:
+    urls = []
+    seen = set()
+    for line in raw.splitlines():
+        for part in line.replace("，", ",").split(","):
+            url = part.strip()
+            if url and url not in seen:
+                seen.add(url)
+                urls.append(url)
+    return urls
+
+
+def render_comparison_table(reports: list[AnalysisReport]) -> None:
+    rows = [
+        ("社區", [r.community_name for r in reports]),
+        ("合理單價（不含車位）", [r.unit_price_range for r in reports]),
+        ("合理總價（含車位）", [r.total_price_range for r in reports]),
+        ("本戶前次成交", [getattr(r, "previous_sale", "查無資料") for r in reports]),
+        ("權狀面積", [r.registered_area for r in reports]),
+        ("有無車位", [getattr(r, "parking_status", "無") for r in reports]),
+        ("主建物", [r.main_building_area for r in reports]),
+        ("屋齡", [r.house_age for r in reports]),
+        ("樓層", [r.floor for r in reports]),
+        ("採光面數", [r.lighting_faces for r in reports]),
+        ("廁所對外窗", [r.bathroom_window for r in reports]),
+        ("最近捷運", [r.nearest_mrt for r in reports]),
+        ("最近超市", [r.nearest_supermarket for r in reports]),
+    ]
+    table = {"項目": [row[0] for row in rows]}
+    for idx in range(len(reports)):
+        table[f"物件 {idx + 1}"] = [row[1][idx] for row in rows]
+    st.dataframe(table, use_container_width=True, hide_index=True)
+
+
+with st.container():
+    st.markdown('<div class="sticky-header"></div>', unsafe_allow_html=True)
+    st.markdown('<p class="sticky-title">🏠 房產分析助手</p>', unsafe_allow_html=True)
+    mode = st.radio("分析模式", ["單一分析", "多物件比較"], horizontal=True, label_visibility="collapsed")
+
+    if mode == "單一分析":
+        c_input, c_clear, c_action = st.columns([7, 1.2, 1.5])
+        with c_input:
+            st.text_input(
+                "房屋網址",
+                placeholder="貼上房屋網址…",
+                key="single_url",
+                label_visibility="collapsed",
+            )
+        with c_clear:
+            st.button("🗑 清空", on_click=clear_single_url, use_container_width=True)
+        with c_action:
+            run_single = st.button("開始分析", type="primary", use_container_width=True)
+    else:
+        c_top1, c_top2 = st.columns([8, 1.5])
+        with c_top1:
+            st.caption("每行一個網址，或用逗號分隔（建議 2～4 間）")
+        with c_top2:
+            st.button("🗑 清空全部", on_click=clear_compare_urls, use_container_width=True)
+        st.text_area(
+            "多個房屋網址",
+            placeholder="貼上多個網址，每行一個…",
+            height=90,
+            key="compare_urls",
+            label_visibility="collapsed",
+        )
+        run_compare = st.button("開始比較", type="primary")
+
+if mode == "單一分析" and run_single:
+    url = st.session_state.single_url.strip()
+    if not url:
+        st.warning("請先貼上房屋網址。")
+        st.session_state.single_report = None
+    else:
+        with st.spinner("正在分析，請稍候…"):
+            try:
+                st.session_state.single_report = analyze_url(url)
+                st.session_state.compare_reports = None
+            except ValueError as exc:
+                st.error(str(exc))
+                st.session_state.single_report = None
+            except Exception:
+                st.error("讀取失敗，請確認網址是否正確。")
+                st.session_state.single_report = None
+
+elif mode == "多物件比較" and run_compare:
+    urls = parse_urls(st.session_state.compare_urls)
+    if len(urls) < 2:
+        st.warning("請至少貼上 2 個房屋網址。")
+        st.session_state.compare_reports = None
+    elif len(urls) > 4:
+        st.warning("一次最多比較 4 間。")
+        st.session_state.compare_reports = None
+    else:
+        reports: list[AnalysisReport] = []
+        errors: list[str] = []
+        progress = st.progress(0, text="準備中…")
+        for idx, url in enumerate(urls):
+            progress.progress(idx / len(urls), text=f"分析第 {idx + 1} / {len(urls)} 間…")
+            try:
+                reports.append(analyze_url(url))
+            except ValueError as exc:
+                errors.append(f"第 {idx + 1} 間：{exc}")
+            except Exception:
+                errors.append(f"第 {idx + 1} 間：讀取失敗")
+        progress.progress(1.0, text="完成")
+
+        for err in errors:
+            st.error(err)
+
+        if len(reports) >= 2:
+            st.session_state.compare_reports = reports
+            st.session_state.single_report = None
+        elif len(reports) == 1:
+            st.warning("只有 1 間成功，請檢查其他網址。")
+            st.session_state.single_report = reports[0]
+            st.session_state.compare_reports = None
+        else:
+            st.session_state.compare_reports = None
+
+if mode == "單一分析" and st.session_state.single_report:
+    render_report(st.session_state.single_report)
+
+elif mode == "多物件比較" and st.session_state.compare_reports:
+    reports = st.session_state.compare_reports
+    st.markdown('<div class="section-card">', unsafe_allow_html=True)
+    section_header("比較總表")
+    render_comparison_table(reports)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    cols = st.columns(len(reports))
+    for col, report in zip(cols, reports):
+        with col:
+            st.markdown(f"**{report.community_name}**")
+            render_report(report, show_market=False, compact=True)
