@@ -487,6 +487,67 @@ def usable_unit_prices(deals: list[LandDeal]) -> list[float]:
     )
 
 
+def deal_age_months(date_text: str, today: Optional[date] = None) -> Optional[int]:
+    """成交距今幾個民國月。115-03 在 2026-08 是 5 個月。"""
+    match = re.match(r"(\d{2,3})-(\d{1,2})", date_text or "")
+    if not match:
+        return None
+    year, month = int(match.group(1)), int(match.group(2))
+    if not 1 <= month <= 12:
+        return None
+    today = today or date.today()
+    return (today.year - 1911 - year) * 12 + (today.month - month)
+
+
+def split_recent_deals(
+    deals: list[LandDeal], months: int = 12, today: Optional[date] = None
+) -> tuple[list[LandDeal], list[LandDeal]]:
+    recent, older = [], []
+    for deal in deals:
+        age = deal_age_months(deal.date, today)
+        if age is not None and 0 <= age <= months:
+            recent.append(deal)
+        else:
+            older.append(deal)
+    return recent, older
+
+
+def weighted_community_unit_prices(
+    recent: list[LandDeal],
+    older: list[LandDeal],
+    fallback: list[LandDeal],
+    fallback_tier: str,
+) -> tuple[Optional[float], Optional[float], Optional[float], int, str]:
+    """近一年同社區佔約八成，較早同社區兩成；沒有近一年才改用路段備援。"""
+    recent_prices = usable_unit_prices(recent)
+    older_prices = usable_unit_prices(older)
+    if recent_prices:
+        recent_mid = statistics.median(recent_prices)
+        if older_prices:
+            mid = round(0.8 * recent_mid + 0.2 * statistics.median(older_prices), 1)
+            tier = (
+                f"近一年同社區 {len(recent_prices)} 筆為主（約八成），"
+                f"較早同社區 {len(older_prices)} 筆為輔"
+            )
+            sample = len(recent_prices) + len(older_prices)
+        else:
+            mid = round(recent_mid, 1)
+            tier = f"近一年同社區成交 {len(recent_prices)} 筆"
+            sample = len(recent_prices)
+        if len(recent_prices) == 1:
+            low, high = round(recent_prices[0] * 0.95, 2), round(recent_prices[0] * 1.05, 2)
+        else:
+            low, high = recent_prices[0], recent_prices[-1]
+        return min(low, mid), mid, max(high, mid), sample, tier
+
+    if older_prices:
+        low, mid, high, sample = unit_price_quartiles(older)
+        return low, mid, high, sample, "同社區成交（近一年無樣本，改採較早成交）"
+
+    low, mid, high, sample = unit_price_quartiles(fallback)
+    return low, mid, high, sample, fallback_tier
+
+
 def unit_price_quartiles(deals: list[LandDeal]) -> tuple[Optional[float], Optional[float], Optional[float], int]:
     """回傳房屋單價（已扣除車位）的 25%、中位、75% 與樣本數。"""
     values = usable_unit_prices(deals)

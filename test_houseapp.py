@@ -157,6 +157,26 @@ class AddressTests(unittest.TestCase):
         self.assertEqual(low, 83.21)
         self.assertEqual(high, 97.47)
 
+    def test_recent_same_community_dominates_valuation(self):
+        self.assertEqual(plvr.deal_age_months("115-03", today=date(2026, 8, 29)), 5)
+        self.assertEqual(plvr.deal_age_months("113-03", today=date(2026, 8, 29)), 29)
+        recent = [deal(date="115-03", house_unit_price=97.47, parking_ping=0)]
+        older = [
+            deal(date="113-03", house_unit_price=84.22, parking_ping=0),
+            deal(date="113-01", house_unit_price=85.51, parking_ping=0),
+            deal(date="112-08", house_unit_price=85.26, parking_ping=0),
+            deal(date="112-06", house_unit_price=83.21, parking_ping=0),
+        ]
+        low, mid, high, n, tier = plvr.weighted_community_unit_prices(
+            recent, older, older, "同路段"
+        )
+        self.assertIn("近一年同社區", tier)
+        self.assertEqual(n, 5)
+        # 八成近一年 97.47、兩成較早中位約 84.7 → 中位應接近 95，而不是被舊價拉到 85。
+        self.assertGreater(mid, 93)
+        self.assertLess(mid, 98)
+        self.assertGreaterEqual(low, 90)
+
     def test_split_address_keeps_main_door_not_subno(self):
         want = _split_tw_address("台北市內湖區康寧路三段54-5號")
         self.assertEqual(want["city"], "台北市")

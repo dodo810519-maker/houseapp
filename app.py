@@ -170,7 +170,7 @@ _start_plvr_warmup()
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def cached_analyze_url(url: str, _cache_v: int = 7) -> AnalysisReport:
+def cached_analyze_url(url: str, _cache_v: int = 8) -> AnalysisReport:
     return analyze_url(url)
 
 

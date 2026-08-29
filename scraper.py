@@ -1620,7 +1620,7 @@ def estimate_market_from_plvr(
             f"車位 {previous.parking_ping:.2f} 坪／{previous.parking_type or '未載明'}）{note}"
         )
 
-    comparables, tier = plvr.find_comparables(
+    comparables, fallback_tier = plvr.find_comparables(
         deals,
         want.get("district", ""),
         building_deals,
@@ -1635,7 +1635,10 @@ def estimate_market_from_plvr(
         building_scope=building_scope,
     )
 
-    low_unit, mid_unit, high_unit, sample = plvr.unit_price_quartiles(comparables)
+    recent, older = plvr.split_recent_deals(building_deals, months=12)
+    low_unit, mid_unit, high_unit, sample, tier = plvr.weighted_community_unit_prices(
+        recent, older, comparables, fallback_tier
+    )
     if not low_unit or not high_unit:
         return result
 
@@ -1682,7 +1685,7 @@ def estimate_market_from_plvr(
     else:
         ping_note = f"本戶扣除車位後約 {house_ping:.2f} 坪。"
     result.comment = (
-        f"依內政部實價登錄近 {len(seasons)} 季資料，取「{tier}」共 {sample} 筆成交，"
+        f"依內政部實價登錄近 {len(seasons)} 季資料，取「{tier}」，"
         f"房屋單價中位 {mid_unit} 萬/坪；{ping_note}{parking_note}"
     )
     sources.append(
