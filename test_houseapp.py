@@ -23,6 +23,7 @@ from scraper import (
     _pick_leju_candidate,
     _plvr_parking_keywords,
     _price_to_wan,
+    _google_translate_proxy_url,
     _rakuya_ehid,
     merge_community_fields,
     parse_cthouse_listing,
@@ -225,6 +226,14 @@ class UrlParseTests(unittest.TestCase):
             "0b0136347737533",
         )
         self.assertEqual(_rakuya_ehid("https://community.rakuya.com.tw/38039/sell"), "")
+
+    def test_rakuya_translate_proxy_url(self):
+        url = _google_translate_proxy_url(
+            "https://www.rakuya.com.tw/sell_item/info?ehid=0b0136347737533"
+        )
+        self.assertIn("www-rakuya-com-tw.translate.goog", url)
+        self.assertIn("ehid=0b0136347737533", url)
+        self.assertIn("_x_tr_pto=wapp", url)
 
 
 class MergeCommunityTests(unittest.TestCase):

@@ -2358,6 +2358,48 @@ def _fetch_page(url: str, referer: str = "") -> str:
         return response.read().decode("utf-8", "ignore")
 
 
+def _google_translate_proxy_url(url: str) -> str:
+    """把樂屋網址轉成 translate.goog，讓 Google 代抓，避開 Cloudflare。"""
+    parsed = urlparse(url)
+    host = parsed.netloc.split("@")[-1].split(":")[0]
+    goog_host = f"{host.replace('.', '-')}.translate.goog"
+    query = [
+        (key, value)
+        for key, value in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+        if not key.startswith("_x_tr_")
+    ]
+    query.extend(
+        [
+            ("_x_tr_sl", "auto"),
+            ("_x_tr_tl", "en"),
+            ("_x_tr_hl", "en"),
+            ("_x_tr_pto", "wapp"),
+        ]
+    )
+    return urllib.parse.urlunparse(
+        ("https", goog_host, parsed.path or "/", "", urllib.parse.urlencode(query), "")
+    )
+
+
+def _fetch_rakuya_html(url: str) -> str:
+    """雲端 IP 常被 Cloudflare 擋，優先走 Google 翻譯中轉；失敗再直抓。"""
+    last_error = ""
+    try:
+        html = _fetch_page(_google_translate_proxy_url(url), "https://translate.google.com/")
+        if "window.itemInfo" in html:
+            return html
+        last_error = "中轉頁沒有物件資料"
+    except Exception as extra:
+        last_error = str(extra)
+    try:
+        return _fetch_impersonated(url, must_contain="window.itemInfo")
+    except ValueError as extra:
+        last_error = str(extra)
+    raise ValueError(
+        f"樂屋網頁被防護擋下（{last_error}），請稍後再試，或改貼 591／信義／永慶原網站網址。"
+    )
+
+
 def _fetch_impersonated(url: str, referer: str = "", must_contain: str = "") -> str:
     """樂屋有 Cloudflare，一般 urllib 會 403，改用瀏覽器 TLS 指紋抓頁。"""
     try:
@@ -2843,7 +2885,7 @@ def analyze_rakuya(url: str) -> AnalysisReport:
             continue
         seen.add(candidate)
         try:
-            html = _fetch_impersonated(candidate, must_contain="window.itemInfo")
+            html = _fetch_rakuya_html(candidate)
             page_url = candidate
             break
         except ValueError as exc:

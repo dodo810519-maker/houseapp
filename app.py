@@ -468,12 +468,14 @@ if mode == "單一分析" and run_single:
                 st.session_state.compare_reports = None
                 status.update(label="分析完成", state="complete")
             except ValueError as exc:
+                status.write(str(exc))
                 status.update(label="分析失敗", state="error")
                 st.error(str(exc))
                 st.session_state.single_report = None
-            except Exception as exc:
+            except Exception as extra:
+                status.write(f"讀取失敗：{extra}")
                 status.update(label="分析失敗", state="error")
-                st.error(f"讀取失敗：{exc}")
+                st.error(f"讀取失敗：{extra}")
                 st.session_state.single_report = None
 
 elif mode == "多物件比較" and run_compare:
