@@ -140,12 +140,35 @@ def _info_map(items: list) -> dict:
     return result
 
 
+def _first_query_value(url: str, *keys: str) -> str:
+    query = urllib.parse.parse_qs(urlparse(url).query)
+    for key in keys:
+        value = (query.get(key) or [""])[0].strip()
+        if value:
+            return value
+    return ""
+
+
+def _community_overview_error(site: str) -> ValueError:
+    return ValueError(
+        f"這是{site}社區總覽或搜尋頁，沒有單一戶的開價與權狀。"
+        "請點進要分析的那一戶，再把物件網址貼上來。"
+    )
+
+
 def _parse_591_id(url: str) -> str:
-    """接受電腦版、手機版、以及只貼物件編號。"""
+    """接受電腦版、手機版、社區裡點進去的物件頁，以及只貼物件編號。"""
     text = (url or "").strip()
     if re.fullmatch(r"\d{6,}", text):
         return text
-    match = re.search(r"(?:sale|m|house)\.591\.com\.tw/.*?(\d{6,})", text)
+    for key in ("id", "house_id", "post_id", "item", "aid"):
+        value = _first_query_value(text, key)
+        if re.fullmatch(r"\d{6,}", value):
+            return value
+    path = urlparse(text).path.lower()
+    if re.search(r"/(?:housing|community)(?:/|$)", path) and "house/detail" not in path:
+        raise _community_overview_error("591")
+    match = re.search(r"591\.com\.tw/.*?(\d{6,})", text)
     if not match:
         match = re.search(r"/(\d{6,})\.html", text)
     if not match:
@@ -153,6 +176,66 @@ def _parse_591_id(url: str) -> str:
     if not match:
         raise ValueError("這不是有效的 591 售屋網址，請確認後再試。")
     return match.group(1)
+
+
+def _parse_sinyi_id(url: str) -> str:
+    match = re.search(r"/buy/house/([A-Za-z0-9]+)", url or "", re.I)
+    if match:
+        return match.group(1)
+    value = _first_query_value(url, "hid", "houseNo", "house_id", "itemNo", "houseid")
+    if value and re.fullmatch(r"[A-Za-z0-9]{4,12}", value):
+        return value
+    return ""
+
+
+def _parse_yungching_id(url: str) -> str:
+    match = re.search(r"/house/(\d{5,})", url or "")
+    if match:
+        return match.group(1)
+    value = _first_query_value(url, "hid", "houseId", "itemid", "id")
+    if value.isdigit() and len(value) >= 5:
+        return value
+    return ""
+
+
+def _parse_housefun_id(url: str) -> str:
+    match = re.search(r"/buy/house/(\d+)", url or "")
+    if match:
+        return match.group(1)
+    value = _first_query_value(url, "hid", "houseid", "id")
+    if value.isdigit() and len(value) >= 5:
+        return value
+    return ""
+
+
+def _parse_etwarm_id(url: str) -> str:
+    match = re.search(r"/houses/buy/(\d+)", url or "") or re.search(r"/house(?:s)?/(\d+)", url or "")
+    if match:
+        return match.group(1)
+    value = _first_query_value(url, "id", "hid", "house_id")
+    if value.isdigit() and len(value) >= 4:
+        return value
+    return ""
+
+
+def _parse_twhg_id(url: str) -> str:
+    match = re.search(r"(?:/buy/|/object/)?([A-Za-z]{2}\d{6,})", url or "")
+    if match:
+        return match.group(1).upper()
+    value = _first_query_value(url, "objectNo", "caseNo", "sn", "id")
+    if value and re.fullmatch(r"[A-Za-z]{2}\d{6,}", value):
+        return value.upper()
+    return ""
+
+
+def _parse_hbhousing_id(url: str) -> str:
+    value = _first_query_value(url, "sn", "SN")
+    if value:
+        return value
+    match = re.search(r"/detail/([A-Za-z0-9]+)", url or "") or re.search(
+        r"[?&]sn=([A-Za-z0-9]+)", url or "", re.I
+    )
+    return match.group(1) if match else ""
 
 
 def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> int:
@@ -1678,6 +1761,26 @@ def _leju_norm(text: str) -> str:
     return re.sub(r"[\s\-－—_/／、,，.．()（）]", "", text).lower()
 
 
+_LEJU_NAME_EXTRA = re.compile(
+    r"^(?:[一二三四五六七八九十百\d]+期|社區|大樓|花園|莊園|廣場|官邸)$"
+)
+
+
+def _leju_names_compatible(target: str, item: str) -> bool:
+    """允許「觀湖一期」對上「觀湖」，但不要把「民權觀湖」當成「觀湖」。"""
+    target_n = _leju_norm(target)
+    item_n = _leju_norm(item)
+    if not target_n or not item_n:
+        return False
+    if target_n == item_n:
+        return True
+    if item_n.startswith(target_n) and _LEJU_NAME_EXTRA.match(item_n[len(target_n) :]):
+        return True
+    if target_n.startswith(item_n) and _LEJU_NAME_EXTRA.match(target_n[len(item_n) :]):
+        return True
+    return False
+
+
 def _split_tw_address(*addresses: str) -> dict:
     text = " ".join(_clean(a) for a in addresses if a and a != UNKNOWN)
     text = text.replace("臺", "台")
@@ -1753,7 +1856,7 @@ def _pick_leju_candidate(candidates: list[dict], want: dict, community_name: str
         if target_name and item_name:
             if item_name == target_name:
                 score = 3
-            elif target_name in item_name or item_name in target_name:
+            elif _leju_names_compatible(target_name, item_name):
                 score = 2
             else:
                 continue
@@ -1807,7 +1910,7 @@ def _leju_result_matches(parsed: dict, candidate: dict, want: dict, community_na
     parsed_name = _leju_norm(parsed.get("name", ""))
     target_name = _leju_norm(community_name)
     if parsed_name and target_name:
-        return target_name in parsed_name or parsed_name in target_name
+        return _leju_names_compatible(community_name, parsed.get("name", ""))
     if want["road"] and want["road"] in _clean(parsed.get("address", "")):
         return True
     return False
@@ -1929,8 +2032,8 @@ def _build_address(base: dict, community_address: str) -> str:
 
 
 def analyze_591(url: str) -> AnalysisReport:
-    clean_url = url.strip().split("?")[0]
-    house_id = _parse_591_id(clean_url)
+    house_id = _parse_591_id(url)
+    clean_url = f"https://sale.591.com.tw/home/house/detail/2/{house_id}.html"
     detail = fetch_591_detail(house_id)
     base = detail.get("baseInfo") or {}
     info = _info_map(base.get("info"))
@@ -2255,7 +2358,7 @@ def _fetch_page(url: str, referer: str = "") -> str:
         return response.read().decode("utf-8", "ignore")
 
 
-def _fetch_impersonated(url: str, referer: str = "") -> str:
+def _fetch_impersonated(url: str, referer: str = "", must_contain: str = "") -> str:
     """樂屋有 Cloudflare，一般 urllib 會 403，改用瀏覽器 TLS 指紋抓頁。"""
     try:
         from curl_cffi import requests as cffi_requests
@@ -2268,17 +2371,34 @@ def _fetch_impersonated(url: str, referer: str = "") -> str:
         "Referer": referer or "https://www.rakuya.com.tw/",
     }
     last_error = ""
-    for impersonate in ("chrome131", "chrome124", "chrome"):
+    for impersonate in ("chrome136", "chrome131", "chrome124", "safari18_0", "chrome"):
         try:
             response = cffi_requests.get(
-                url, impersonate=impersonate, timeout=25, headers=headers
+                url, impersonate=impersonate, timeout=20, headers=headers
             )
-            if response.status_code == 200 and response.text:
-                return response.text
-            last_error = f"HTTP {response.status_code}"
+            if response.status_code != 200 or not response.text:
+                last_error = f"HTTP {response.status_code}"
+                continue
+            text = response.text
+            if must_contain and must_contain in text:
+                return text
+            if re.search(
+                r"<title>\s*Just a moment|cf-browser-verification|cdn-cgi/challenge-platform|Attention Required! \| Cloudflare",
+                text,
+                re.I,
+            ):
+                last_error = "Cloudflare 驗證頁"
+                continue
+            if must_contain:
+                last_error = "頁面沒有物件資料"
+                continue
+            return text
         except Exception as exc:
             last_error = str(exc)
-    raise ValueError(f"樂屋網頁被防護擋下（{last_error}），請稍後再試，或改貼 591／信義／永慶網址。")
+    raise ValueError(
+        f"樂屋網頁被防護擋下（{last_error}），請稍後再試；"
+        "社區頁也可以貼，或改貼 591／信義／永慶原網站網址。"
+    )
 
 
 def _jsonld_blocks(html: str) -> list:
@@ -2577,9 +2697,12 @@ def parse_rakuya_html(html: str, url: str) -> PortalListing:
     detail = info.get("detail") or {}
     special = info.get("special") or {}
     images = info.get("images") or {}
+    nearby = info.get("nearby") or {}
 
     listing.title = _clean(title.get("hname") or "")
-    listing.community_name = _clean(title.get("community") or "")
+    listing.community_name = _clean(
+        title.get("community") or nearby.get("nearByCommunity") or ""
+    )
     listing.listing_address = _clean(title.get("address") or "")
     listing.ask_price_wan = _price_to_wan(price.get("price"))
     if price.get("singlePrice"):
@@ -2587,16 +2710,22 @@ def parse_rakuya_html(html: str, url: str) -> PortalListing:
     if price.get("totalsize"):
         listing.registered = f"{price['totalsize']}坪"
     listing.main_area = _clean(detail.get("mainSize") or "")
-    listing.parking_desc = _clean(detail.get("parking") or "")
-    listing.parking_area = _clean(detail.get("parkingSize") or "")
-    listing.parking_unknown = not listing.parking_desc and not listing.parking_area
-    listing.registered_use = _clean(detail.get("itemUseType") or detail.get("propertyUsecode") or "")
+    parking_text = _clean(detail.get("parking") or "")
+    if parking_text in ("", "-", "—", "－", "--"):
+        parking_text = _clean(detail.get("parkingGarage") or "")
+    _set_listing_parking(listing, parking_text)
+    parking_size = _clean(detail.get("parkingSize") or "")
+    if parking_size and parking_size not in ("-", "—", "－", "--"):
+        listing.parking_area = parking_size
+    listing.registered_use = _clean(
+        detail.get("propertyUsecode") or detail.get("itemUseType") or ""
+    )
     listing.listing_id = _clean(detail.get("ehid") or ehid)
     age_value = detail.get("ageValue")
     if age_value not in (None, ""):
         listing.house_age = f"{age_value}{detail.get('ageUnit') or '年'}"
     trans_floors = _clean(str(detail.get("transFloors") or ""))
-    max_floors = _clean(str(detail.get("maxFloors") or ""))
+    max_floors = _clean(str(detail.get("maxFloors") or detail.get("surFloors") or ""))
     if trans_floors and max_floors:
         listing.floor = f"{trans_floors}F/{max_floors}F"
     beds = detail.get("patternBedrooms")
@@ -2605,13 +2734,17 @@ def parse_rakuya_html(html: str, url: str) -> PortalListing:
     if beds is not None:
         listing.layout = f"{beds}房{lives or 0}廳{baths or 0}衛"
     listing.remark = _clean(re.sub(r"<br\s*/?>", "\n", str(special.get("description") or "")))
-    listing.management_fee = _clean(detail.get("manageFee") or "")
+    fee = _clean(detail.get("manageFee") or "")
+    listing.management_fee = f"{fee}元" if fee.isdigit() else fee
+    share = _to_float(detail.get("shareSize"))
+    total = _to_float(price.get("totalsize"))
+    if share and total:
+        listing.public_ratio = f"{round(share / total * 100, 1)}%"
     photos = []
     for photo in images.get("photo") or []:
         if isinstance(photo, dict) and photo.get("url") and not photo.get("isDefaultImage"):
             photos.append(photo["url"])
     listing.images = _unique_urls(photos)
-    nearby = info.get("nearby") or {}
     cover = nearby.get("cover")
     if cover and not listing.images:
         listing.images = _unique_urls([cover])
@@ -2619,10 +2752,11 @@ def parse_rakuya_html(html: str, url: str) -> PortalListing:
 
 
 def analyze_sinyi(url: str) -> AnalysisReport:
-    match = re.search(r"/buy/house/([A-Za-z0-9]+)", url)
-    if not match:
-        raise ValueError("這不是有效的信義房屋物件網址。")
-    listing_id = match.group(1)
+    listing_id = _parse_sinyi_id(url)
+    if not listing_id:
+        if re.search(r"communitylist|communityinfo|/community/", url or "", re.I):
+            raise _community_overview_error("信義房屋")
+        raise ValueError("這不是有效的信義房屋物件網址。社區頁或物件頁都可以，請貼單一戶。")
     page_url = f"https://www.sinyi.com.tw/buy/house/{listing_id}"
     html = _fetch_page(page_url, "https://www.sinyi.com.tw/")
     listing = parse_sinyi_html(html, page_url)
@@ -2632,10 +2766,11 @@ def analyze_sinyi(url: str) -> AnalysisReport:
 
 
 def analyze_yungching(url: str) -> AnalysisReport:
-    match = re.search(r"/house/(\d+)", url)
-    if not match:
-        raise ValueError("這不是有效的永慶房屋物件網址。")
-    listing_id = match.group(1)
+    listing_id = _parse_yungching_id(url)
+    if not listing_id:
+        if re.search(r"/community|/region/", url or "", re.I):
+            raise _community_overview_error("永慶房屋")
+        raise ValueError("這不是有效的永慶房屋物件網址。社區頁或物件頁都可以，請貼單一戶。")
     page_url = f"https://buy.yungching.com.tw/house/{listing_id}"
     html = _fetch_page(page_url, "https://buy.yungching.com.tw/")
     listing = parse_yungching_html(html, page_url)
@@ -2644,17 +2779,84 @@ def analyze_yungching(url: str) -> AnalysisReport:
     return analyze_portal_listing(listing)
 
 
+def _rakuya_ehid(url: str) -> str:
+    ehid = _first_query_value(url, "ehid")
+    if ehid:
+        return ehid
+    match = re.search(r"ehid[=/]([A-Za-z0-9]+)", url or "", re.I)
+    return match.group(1) if match else ""
+
+
+def _fill_listing_from_group_id(listing: PortalListing, group_id: str) -> None:
+    """樂屋常轉貼信義／永慶物件；來源頁可補樓層等缺漏欄位。"""
+    if listing.floor and listing.community_name and not listing.parking_unknown:
+        return
+    group_id = _clean(group_id or "")
+    if "/" not in group_id:
+        return
+    source, item_id = group_id.split("/", 1)
+    other = None
+    try:
+        if source == "sinyi" and item_id:
+            page_url = f"https://www.sinyi.com.tw/buy/house/{item_id}"
+            other = parse_sinyi_html(_fetch_page(page_url, "https://www.sinyi.com.tw/"), page_url)
+        elif source == "yungching" and item_id:
+            page_url = f"https://buy.yungching.com.tw/house/{item_id}"
+            other = parse_yungching_html(
+                _fetch_page(page_url, "https://buy.yungching.com.tw/"), page_url
+            )
+    except Exception:
+        return
+    if other is None:
+        return
+    if not listing.floor:
+        listing.floor = other.floor
+    if not listing.community_name:
+        listing.community_name = other.community_name
+    if not listing.listing_address:
+        listing.listing_address = other.listing_address
+    if listing.parking_unknown and not other.parking_unknown:
+        listing.parking_desc = other.parking_desc
+        listing.parking_area = other.parking_area
+        listing.parking_unknown = other.parking_unknown
+    if other.images and not listing.images:
+        listing.images = other.images
+
+
 def analyze_rakuya(url: str) -> AnalysisReport:
-    parsed = urlparse(url)
-    ehid = urllib.parse.parse_qs(parsed.query).get("ehid", [""])[0]
+    ehid = _rakuya_ehid(url)
     if not ehid:
-        match = re.search(r"ehid=([A-Za-z0-9]+)", url)
-        ehid = match.group(1) if match else ""
-    if not ehid:
-        raise ValueError("這不是有效的樂屋物件網址（網址需包含 ehid）。")
-    page_url = f"https://www.rakuya.com.tw/sell_item/info?ehid={ehid}"
-    html = _fetch_impersonated(page_url)
+        if re.search(r"community\.rakuya\.com\.tw|rakuya\.com\.tw/.*/(?:sell|search|result)", url or "", re.I):
+            raise _community_overview_error("樂屋網")
+        raise ValueError("這不是有效的樂屋物件網址。社區賣屋頁或一般物件頁都可以，網址需包含 ehid。")
+    candidates = []
+    stripped = (url or "").strip().split("#")[0]
+    if "rakuya.com.tw" in stripped.lower() and "ehid=" in stripped.lower():
+        candidates.append(re.sub(r"&from=[^&]*", "", stripped, flags=re.I))
+    candidates.append(f"https://www.rakuya.com.tw/sell_item/info?ehid={ehid}")
+    html = ""
+    page_url = candidates[-1]
+    last_error = ""
+    seen: set[str] = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        try:
+            html = _fetch_impersonated(candidate, must_contain="window.itemInfo")
+            page_url = candidate
+            break
+        except ValueError as exc:
+            last_error = str(exc)
+            html = ""
+    if not html:
+        raise ValueError(
+            last_error
+            or "樂屋網頁被防護擋下，請稍後再試；社區頁也可以貼，或改貼 591／信義／永慶原網站網址。"
+        )
     listing = parse_rakuya_html(html, page_url)
+    info = _extract_js_object(html, "window.itemInfo")
+    _fill_listing_from_group_id(listing, (info.get("nearby") or {}).get("groupId") or "")
     return analyze_portal_listing(listing)
 
 
@@ -2973,7 +3175,9 @@ def parse_cthouse_listing(data: dict, url: str, listing_id: str) -> PortalListin
 def analyze_cthouse(url: str) -> AnalysisReport:
     listing_id = _parse_cthouse_id(url)
     if not listing_id:
-        raise ValueError("這不是有效的中信房屋物件網址。")
+        if re.search(r"/community", url or "", re.I):
+            raise _community_overview_error("中信房屋")
+        raise ValueError("這不是有效的中信房屋物件網址。社區頁或物件頁都可以，請貼單一戶。")
     data = _fetch_cthouse_json(listing_id)
     page_url = url if url.startswith("http") else f"https://buy.cthouse.com.tw/house/{listing_id}-sell.html"
     listing = parse_cthouse_listing(data, page_url, listing_id)
@@ -2983,10 +3187,11 @@ def analyze_cthouse(url: str) -> AnalysisReport:
 
 
 def analyze_hbhousing(url: str) -> AnalysisReport:
-    match = re.search(r"[?&]sn=([A-Za-z0-9]+)", url) or re.search(r"/detail/([A-Za-z0-9]+)", url)
-    if not match:
-        raise ValueError("這不是有效的住商不動產物件網址。")
-    sn = match.group(1)
+    sn = _parse_hbhousing_id(url)
+    if not sn:
+        if re.search(r"/community", url or "", re.I):
+            raise _community_overview_error("住商不動產")
+        raise ValueError("這不是有效的住商不動產物件網址。社區頁或物件頁都可以，請貼單一戶。")
     page_url = f"https://www.hbhousing.com.tw/detail?sn={sn}"
     html = _fetch_page(page_url, "https://www.hbhousing.com.tw/")
     listing = parse_hbhousing_html(html, page_url)
@@ -2996,10 +3201,12 @@ def analyze_hbhousing(url: str) -> AnalysisReport:
 
 
 def analyze_twhg(url: str) -> AnalysisReport:
-    match = re.search(r"/buy/([A-Za-z]{2}\d+)", url)
-    if not match:
-        raise ValueError("這不是有效的台灣房屋物件網址。")
-    page_url = f"https://www.twhg.com.tw/buy/{match.group(1)}"
+    listing_id = _parse_twhg_id(url)
+    if not listing_id:
+        if re.search(r"/community", url or "", re.I):
+            raise _community_overview_error("台灣房屋")
+        raise ValueError("這不是有效的台灣房屋物件網址。社區頁或物件頁都可以，請貼單一戶。")
+    page_url = f"https://www.twhg.com.tw/buy/{listing_id}"
     html = _fetch_page(page_url, "https://www.twhg.com.tw/")
     listing = parse_twhg_html(html, page_url)
     if not listing.title and not listing.registered:
@@ -3008,10 +3215,12 @@ def analyze_twhg(url: str) -> AnalysisReport:
 
 
 def analyze_housefun(url: str) -> AnalysisReport:
-    match = re.search(r"/buy/house/(\d+)", url)
-    if not match:
-        raise ValueError("這不是有效的好房網物件網址。")
-    page_url = f"https://buy.housefun.com.tw/buy/house/{match.group(1)}"
+    listing_id = _parse_housefun_id(url)
+    if not listing_id:
+        if re.search(r"/community|/project", url or "", re.I):
+            raise _community_overview_error("好房網")
+        raise ValueError("這不是有效的好房網物件網址。社區頁或物件頁都可以，請貼單一戶。")
+    page_url = f"https://buy.housefun.com.tw/buy/house/{listing_id}"
     html = _fetch_page(page_url, "https://buy.housefun.com.tw/")
     listing = parse_housefun_html(html, page_url)
     if not listing.title and not listing.registered:
@@ -3020,10 +3229,12 @@ def analyze_housefun(url: str) -> AnalysisReport:
 
 
 def analyze_etwarm(url: str) -> AnalysisReport:
-    match = re.search(r"/houses/buy/(\d+)", url)
-    if not match:
-        raise ValueError("這不是有效的東森房屋物件網址。")
-    page_url = f"https://www.etwarm.com.tw/houses/buy/{match.group(1)}"
+    listing_id = _parse_etwarm_id(url)
+    if not listing_id:
+        if re.search(r"/community", url or "", re.I):
+            raise _community_overview_error("東森房屋")
+        raise ValueError("這不是有效的東森房屋物件網址。社區頁或物件頁都可以，請貼單一戶。")
+    page_url = f"https://www.etwarm.com.tw/houses/buy/{listing_id}"
     html = _fetch_page(page_url, "https://www.etwarm.com.tw/")
     listing = parse_etwarm_html(html, page_url)
     if not listing.title and not listing.registered:
@@ -3202,5 +3413,6 @@ def analyze_url(url: str) -> AnalysisReport:
         return analyze_cthouse(text)
     raise ValueError(
         "請貼上房屋物件網址：591、樂屋、信義、永慶、住商、台灣房屋、好房網、東森或中信。"
+        "社區賣屋頁或一般物件頁都可以，但要點進單一戶。"
         "591 也可以只貼物件編號。樂居社區頁也可以，但沒有單一戶的開價與權狀。"
     )

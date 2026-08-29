@@ -432,7 +432,7 @@ with st.container():
         with c_input:
             st.text_input(
                 "房屋網址",
-                placeholder="591、樂屋、信義、永慶、住商、台灣房屋、好房網、東森、中信…",
+                placeholder="物件頁或社區裡的單一戶都可以：591、樂屋、信義、永慶、住商、台灣房屋、好房網、東森、中信…",
                 key="single_url",
                 label_visibility="collapsed",
             )
@@ -448,7 +448,7 @@ with st.container():
             st.button("🗑 清空全部", on_click=clear_compare_urls, use_container_width=True)
         st.text_area(
             "多個房屋網址",
-            placeholder="每行一個網址：591、樂屋、信義、永慶、住商、台灣房屋、好房網、東森、中信…",
+            placeholder="每行一個網址（物件頁或社區裡的單一戶都可以）",
             height=90,
             key="compare_urls",
             label_visibility="collapsed",
@@ -471,9 +471,9 @@ if mode == "單一分析" and run_single:
                 status.update(label="分析失敗", state="error")
                 st.error(str(exc))
                 st.session_state.single_report = None
-            except Exception:
+            except Exception as exc:
                 status.update(label="分析失敗", state="error")
-                st.error("讀取失敗，請確認網址是否正確。")
+                st.error(f"讀取失敗：{exc}")
                 st.session_state.single_report = None
 
 elif mode == "多物件比較" and run_compare:
@@ -494,8 +494,8 @@ elif mode == "多物件比較" and run_compare:
                 reports.append(cached_analyze_url(url))
             except ValueError as exc:
                 errors.append(f"第 {idx + 1} 間：{exc}")
-            except Exception:
-                errors.append(f"第 {idx + 1} 間：讀取失敗")
+            except Exception as exc:
+                errors.append(f"第 {idx + 1} 間：{exc}")
         progress.progress(1.0, text="完成")
 
         for err in errors:

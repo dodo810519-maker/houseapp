@@ -12,10 +12,18 @@ from scraper import (
     _format_registered_area,
     _parse_cthouse_id,
     _parse_591_id,
+    _parse_etwarm_id,
+    _parse_hbhousing_id,
+    _parse_housefun_id,
     _parse_parking_info,
+    _parse_sinyi_id,
+    _parse_twhg_id,
+    _parse_yungching_id,
+    _leju_names_compatible,
     _pick_leju_candidate,
     _plvr_parking_keywords,
     _price_to_wan,
+    _rakuya_ehid,
     merge_community_fields,
     parse_cthouse_listing,
     parse_etwarm_html,
@@ -177,7 +185,46 @@ class UrlParseTests(unittest.TestCase):
     def test_desktop_mobile_and_bare_id(self):
         self.assertEqual(_parse_591_id("https://sale.591.com.tw/home/house/detail/2/20676115.html?from=x"), "20676115")
         self.assertEqual(_parse_591_id("https://m.591.com.tw/v2/sale/detail/20266044"), "20266044")
+        self.assertEqual(_parse_591_id("https://www.591.com.tw/home/house/detail/2/20676115.html"), "20676115")
         self.assertEqual(_parse_591_id("20676115"), "20676115")
+        self.assertEqual(
+            _parse_591_id("https://sale.591.com.tw/home/housing/7479?id=20676115"),
+            "20676115",
+        )
+
+    def test_591_community_overview_rejected(self):
+        with self.assertRaises(ValueError) as ctx:
+            _parse_591_id("https://sale.591.com.tw/home/housing/7479")
+        self.assertIn("社區總覽", str(ctx.exception))
+
+    def test_portal_community_and_listing_urls(self):
+        self.assertEqual(
+            _parse_sinyi_id("https://www.sinyi.com.tw/buy/house/9583ZT?from=community"),
+            "9583ZT",
+        )
+        self.assertEqual(_parse_sinyi_id("https://www.sinyi.com.tw/buy?hid=9583ZT"), "9583ZT")
+        self.assertEqual(
+            _parse_yungching_id("https://buy.yungching.com.tw/house/7106341?from=community"),
+            "7106341",
+        )
+        self.assertEqual(
+            _parse_housefun_id("https://buy.housefun.com.tw/buy/house/6802942?community=1"),
+            "6802942",
+        )
+        self.assertEqual(_parse_etwarm_id("https://www.etwarm.com.tw/houses/buy/707984"), "707984")
+        self.assertEqual(_parse_twhg_id("https://www.twhg.com.tw/buy/TA02534212"), "TA02534212")
+        self.assertEqual(_parse_twhg_id("https://www.twhg.com.tw/object/TA02534212"), "TA02534212")
+        self.assertEqual(_parse_hbhousing_id("https://www.hbhousing.com.tw/detail?sn=YS203907"), "YS203907")
+        self.assertEqual(_parse_hbhousing_id("https://www.hbhousing.com.tw/community/x?sn=YS203907"), "YS203907")
+        self.assertEqual(
+            _rakuya_ehid("https://community.rakuya.com.tw/38039/sell/info?ehid=0b0136347737533&from=communitySearchSell"),
+            "0b0136347737533",
+        )
+        self.assertEqual(
+            _rakuya_ehid("https://www.rakuya.com.tw/sell_item/info?ehid=0b0136347737533"),
+            "0b0136347737533",
+        )
+        self.assertEqual(_rakuya_ehid("https://community.rakuya.com.tw/38039/sell"), "")
 
 
 class MergeCommunityTests(unittest.TestCase):
@@ -282,6 +329,25 @@ class PortalParseTests(unittest.TestCase):
         self.assertEqual(listing.floor, "1F/3F")
         self.assertEqual(listing.parking_desc, "無車位")
         self.assertEqual(listing.layout, "2房2廳1衛")
+
+    def test_rakuya_community_url_and_sur_floors(self):
+        html = """
+        <script>
+        window.itemInfo = {"title":{"hname":"葫洲觀湖兩房","address":"台北市內湖區康寧路三段","community":"觀湖"},"price":{"price":"2,188","singlePrice":"114.14","totalsize":"19.17"},"detail":{"ageValue":"約30","ageUnit":"年","transFloors":"6","maxFloors":"","surFloors":"10","patternBedrooms":2,"patternLivingrooms":2,"patternBathrooms":1,"itemUseType":"電梯大廈","propertyUsecode":"住家用","mainSize":"11.66坪","shareSize":"2.52坪","parking":"-","parkingGarage":"無","parkingSize":"","ehid":"0b0136347737533"},"nearby":{"nearByCommunity":"觀湖","groupId":"sinyi/9583ZT"},"images":{"photo":[]},"special":{"description":""}};
+        </script>
+        """
+        listing = parse_rakuya_html(
+            html,
+            "https://community.rakuya.com.tw/38039/sell/info?ehid=0b0136347737533&from=communitySearchSell",
+        )
+        self.assertEqual(listing.listing_id, "0b0136347737533")
+        self.assertEqual(listing.community_name, "觀湖")
+        self.assertEqual(listing.floor, "6F/10F")
+        self.assertEqual(listing.parking_desc, "無車位")
+        self.assertFalse(listing.parking_unknown)
+        self.assertEqual(listing.registered_use, "住家用")
+        self.assertEqual(listing.ask_price_wan, 2188)
+        self.assertEqual(_rakuya_ehid("https://community.rakuya.com.tw/38039/sell/info?ehid=0b0136347737533&from=communitySearchSell"), "0b0136347737533")
 
     def test_hbhousing_nuxt_payload(self):
         html = """
@@ -425,6 +491,24 @@ class CommunityMatchTests(unittest.TestCase):
         self.assertIsNone(picked)
         picked = _pick_leju_candidate(candidates, want, "中山文華-文華滙")
         self.assertEqual(picked["id"], "L2")
+
+    def test_leju_does_not_treat_similar_community_as_same(self):
+        self.assertFalse(_leju_names_compatible("觀湖", "民權觀湖"))
+        self.assertTrue(_leju_names_compatible("觀湖", "觀湖"))
+        self.assertTrue(_leju_names_compatible("觀湖", "觀湖一期"))
+        candidates = [
+            {"id": "L1", "name": "民權觀湖", "city": "台北市", "district": "內湖區"},
+            {"id": "L2", "name": "觀湖", "city": "台北市", "district": "內湖區"},
+        ]
+        want = {"city": "台北市", "district": "內湖區", "road": "康寧路三段"}
+        picked = _pick_leju_candidate(candidates, want, "觀湖")
+        self.assertEqual(picked["id"], "L2")
+        picked = _pick_leju_candidate(
+            [{"id": "L1", "name": "民權觀湖", "city": "台北市", "district": "內湖區"}],
+            want,
+            "觀湖",
+        )
+        self.assertIsNone(picked)
 
 
 if __name__ == "__main__":
