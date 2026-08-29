@@ -23,6 +23,7 @@ from scraper import (
     _pick_leju_candidate,
     _plvr_parking_keywords,
     _price_to_wan,
+    apply_rakuya_community,
     _google_translate_proxy_url,
     _rakuya_ehid,
     merge_community_fields,
@@ -357,6 +358,31 @@ class PortalParseTests(unittest.TestCase):
         self.assertEqual(listing.registered_use, "住家用")
         self.assertEqual(listing.ask_price_wan, 2188)
         self.assertEqual(_rakuya_ehid("https://community.rakuya.com.tw/38039/sell/info?ehid=0b0136347737533&from=communitySearchSell"), "0b0136347737533")
+
+    def test_rakuya_community_page_fills_missing_env(self):
+        listing = parse_rakuya_html(
+            """
+            <script>
+            window.itemInfo = {"title":{"hname":"葫洲觀湖兩房","address":"台北市內湖區康寧路三段","community":"觀湖","communityUrl":"https://community.rakuya.com.tw/38039"},"price":{"price":"2,188","totalsize":"19.17"},"detail":{"transFloors":"6","surFloors":"10","ehid":"0b0136347737533","parking":"-","parkingGarage":"無"},"nearby":{},"images":{"photo":[]},"special":{}};
+            </script>
+            """,
+            "https://www.rakuya.com.tw/sell_item/info?ehid=0b0136347737533",
+        )
+        html = """
+        <script>
+        window.apiCommunityInfoData = {"status":true,"data":{"name":"民權觀湖","households":"175戶","maxFloor":"10、12~13樓","shareRatio":"14.17%","address":{"cityName":"台北市","areaName":"內湖區","full":"康寧路三段54-5號"},"location":{"lat":25.0714,"lon":121.6094},"building":{"baseArea":"1,210坪"}}};
+        window.apiNearPoi = {"status":true,"data":[{"type":"transport","poiList":[{"cat":"出入口","name":"捷運葫洲站出口1","distance":173}]},{"type":"market","poiList":[{"cat":"超級市場","name":"家樂福內湖民權東店","distance":199}]}]};
+        </script>
+        """
+        apply_rakuya_community(listing, html)
+        self.assertEqual(listing.community_name, "民權觀湖")
+        self.assertEqual(listing.household_count, "175戶")
+        self.assertEqual(listing.land_area, "1,210坪")
+        self.assertEqual(listing.building_floors, "10、12~13樓")
+        self.assertIn("葫洲", listing.nearest_mrt)
+        self.assertIn("家樂福", listing.nearest_shop)
+        self.assertAlmostEqual(listing.lat, 25.0714)
+        self.assertIn("54-5號", listing.listing_address)
 
     def test_hbhousing_nuxt_payload(self):
         html = """

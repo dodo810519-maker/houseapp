@@ -295,6 +295,26 @@ def geocode_google(address: str, api_key: str, timeout: int = 15) -> tuple[Optio
     return _to_float(loc.get("lat")), _to_float(loc.get("lng"))
 
 
+def geocode_nominatim(address: str, timeout: int = 12) -> tuple[Optional[float], Optional[float]]:
+    """沒有 Google 金鑰時，用 OpenStreetMap 把地址轉成座標。"""
+    text = _clean((address or "").split("（")[0])
+    if not text or text == UNKNOWN:
+        return None, None
+    url = (
+        "https://nominatim.openstreetmap.org/search?"
+        f"q={urllib.parse.quote(text)}&format=json&limit=1&countrycodes=tw"
+    )
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "houseapp/1.0"})
+        with urllib.request.urlopen(req, timeout=timeout, context=_ssl_context()) as response:
+            data = json.loads(response.read().decode("utf-8", "ignore"))
+    except Exception:
+        return None, None
+    if not data:
+        return None, None
+    return _to_float(data[0].get("lat")), _to_float(data[0].get("lon"))
+
+
 def _google_walking_distances(
     origin_lat: float,
     origin_lon: float,
@@ -2338,6 +2358,12 @@ class PortalListing:
     lat: Optional[float] = None
     lon: Optional[float] = None
     parking_unknown: bool = False
+    land_area: str = ""
+    household_count: str = ""
+    building_floors: str = ""
+    nearest_mrt: str = ""
+    nearest_shop: str = ""
+    community_url: str = ""
 
 
 def _fetch_page(url: str, referer: str = "") -> str:
@@ -2790,7 +2816,79 @@ def parse_rakuya_html(html: str, url: str) -> PortalListing:
     cover = nearby.get("cover")
     if cover and not listing.images:
         listing.images = _unique_urls([cover])
+    listing.community_url = _clean(title.get("communityUrl") or "")
     return listing
+
+
+def _format_rakuya_poi(name: str, distance) -> str:
+    meters = int(_to_float(distance) or 0)
+    if meters <= 0:
+        return name
+    return f"{name}，{_walk_text(meters)}"
+
+
+def _parse_rakuya_poi(html: str) -> tuple[str, str]:
+    payload = _extract_js_object(html, "window.apiNearPoi")
+    groups = payload.get("data") if isinstance(payload, dict) else []
+    mrt = ""
+    shop = ""
+    for group in groups or []:
+        if not isinstance(group, dict):
+            continue
+        for poi in group.get("poiList") or []:
+            if not isinstance(poi, dict):
+                continue
+            name = _clean(poi.get("name") or "")
+            cat = _clean(poi.get("cat") or "")
+            if not name:
+                continue
+            blob = name + cat
+            if not mrt and ("捷運" in blob or "出入口" in cat):
+                mrt = _format_rakuya_poi(name, poi.get("distance"))
+            if not shop and (
+                "超級市場" in cat or "超市" in cat or any(hint in name for hint in SUPERMARKET_HINTS)
+            ):
+                shop = _format_rakuya_poi(name, poi.get("distance"))
+            if mrt and shop:
+                return mrt, shop
+    return mrt, shop
+
+
+def apply_rakuya_community(listing: PortalListing, html: str) -> None:
+    """樂屋社區頁有正式社區名、戶數、樓高與周邊 POI。"""
+    payload = _extract_js_object(html, "window.apiCommunityInfoData")
+    data = payload.get("data") if isinstance(payload, dict) else {}
+    if not isinstance(data, dict) or not data:
+        return
+    name = _clean(data.get("name") or "")
+    if name:
+        listing.community_name = name
+    addr = data.get("address") or {}
+    if isinstance(addr, dict):
+        full = _clean(
+            f"{addr.get('cityName') or ''}{addr.get('areaName') or ''}{addr.get('full') or addr.get('road') or ''}"
+        )
+        if full:
+            listing.listing_address = full
+    loc = data.get("location") or {}
+    if isinstance(loc, dict):
+        listing.lat = listing.lat or _to_float(loc.get("lat"))
+        listing.lon = listing.lon or _to_float(loc.get("lon") or loc.get("lng"))
+    listing.household_count = _clean(data.get("households") or listing.household_count)
+    listing.building_floors = _clean(data.get("maxFloor") or listing.building_floors)
+    share = _clean(data.get("shareRatio") or "")
+    if share:
+        listing.public_ratio = share
+    building = data.get("building") or {}
+    if isinstance(building, dict):
+        base = _clean(str(building.get("baseArea") or ""))
+        if base:
+            listing.land_area = base if "坪" in base else f"{base}坪"
+    mrt, shop = _parse_rakuya_poi(html)
+    if mrt:
+        listing.nearest_mrt = mrt
+    if shop:
+        listing.nearest_shop = shop
 
 
 def analyze_sinyi(url: str) -> AnalysisReport:
@@ -2863,6 +2961,10 @@ def _fill_listing_from_group_id(listing: PortalListing, group_id: str) -> None:
         listing.parking_unknown = other.parking_unknown
     if other.images and not listing.images:
         listing.images = other.images
+    if not listing.lat:
+        listing.lat = other.lat
+    if not listing.lon:
+        listing.lon = other.lon
 
 
 def analyze_rakuya(url: str) -> AnalysisReport:
@@ -2898,6 +3000,12 @@ def analyze_rakuya(url: str) -> AnalysisReport:
         )
     listing = parse_rakuya_html(html, page_url)
     info = _extract_js_object(html, "window.itemInfo")
+    community_url = listing.community_url or _clean((info.get("title") or {}).get("communityUrl") or "")
+    if community_url:
+        try:
+            apply_rakuya_community(listing, _fetch_rakuya_html(community_url))
+        except Exception:
+            pass
     _fill_listing_from_group_id(listing, (info.get("nearby") or {}).get("groupId") or "")
     return analyze_portal_listing(listing)
 
@@ -3292,12 +3400,22 @@ def analyze_portal_listing(listing: PortalListing) -> AnalysisReport:
 
     api_key = _google_maps_api_key()
     nearby_lat, nearby_lon = listing.lat, listing.lon
-    if (not nearby_lat or not nearby_lon) and api_key and community_address:
-        nearby_lat, nearby_lon = geocode_google(community_address, api_key)
-    nearest_mrt, nearest_shop = UNKNOWN, UNKNOWN
-    if nearby_lat and nearby_lon:
-        nearest_mrt, nearest_shop = fetch_nearby_cached(nearby_lat, nearby_lon, api_key=api_key)
+    if (not nearby_lat or not nearby_lon) and community_address:
+        if api_key:
+            nearby_lat, nearby_lon = geocode_google(community_address, api_key)
+        if not nearby_lat or not nearby_lon:
+            nearby_lat, nearby_lon = geocode_nominatim(community_address)
+    nearest_mrt = _or_unknown(listing.nearest_mrt)
+    nearest_shop = _or_unknown(listing.nearest_shop)
+    if nearby_lat and nearby_lon and (nearest_mrt == UNKNOWN or nearest_shop == UNKNOWN):
+        osm_mrt, osm_shop = fetch_nearby_cached(nearby_lat, nearby_lon, api_key=api_key)
+        if nearest_mrt == UNKNOWN:
+            nearest_mrt = osm_mrt
+        if nearest_shop == UNKNOWN:
+            nearest_shop = osm_shop
         sources.append("Google Maps 周邊設施（步行距離）" if api_key else "OpenStreetMap 周邊設施")
+    elif listing.nearest_mrt or listing.nearest_shop:
+        sources.append(f"{listing.source_name}社區周邊")
 
     registered = listing.registered
     main_area = listing.main_area
@@ -3314,15 +3432,20 @@ def analyze_portal_listing(listing: PortalListing) -> AnalysisReport:
     public_ratio = listing.public_ratio or UNKNOWN
     house_age = _or_unknown(listing.house_age)
     floor_text = _or_unknown(listing.floor)
+    building_floors = listing.building_floors
+    if not building_floors:
+        match = re.search(r"/(\d+)\s*(?:F|樓)", listing.floor or "", re.I)
+        if match:
+            building_floors = f"{match.group(1)}樓"
 
     leju = {}
     if listing.community_name:
         leju = fetch_leju_community(listing.community_name, community_address, listing_address)
     fields_591 = {
         "community_name": listing.community_name,
-        "land_area": "",
-        "household_count": "",
-        "building_floors": "",
+        "land_area": listing.land_area,
+        "household_count": listing.household_count,
+        "building_floors": building_floors,
         "public_ratio": public_ratio if public_ratio != UNKNOWN else "",
         "community_address": community_address,
     }
