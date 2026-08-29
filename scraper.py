@@ -1821,6 +1821,23 @@ def _leju_names_compatible(target: str, item: str) -> bool:
     return False
 
 
+def _leju_name_score(target: str, item: str) -> int:
+    """3 全名相同、2 一期／社區後綴、1 刊登簡稱（觀湖→民權觀湖），0 不採用。"""
+    item_n = _leju_norm(item)
+    if not item_n:
+        return 0
+    target_n = _leju_norm(target)
+    if not target_n:
+        return 1
+    if target_n == item_n:
+        return 3
+    if _leju_names_compatible(target, item):
+        return 2
+    if item_n.endswith(target_n) and len(item_n) - len(target_n) >= 2:
+        return 1
+    return 0
+
+
 def _split_tw_address(*addresses: str) -> dict:
     text = " ".join(_clean(a) for a in addresses if a and a != UNKNOWN)
     text = text.replace("臺", "台")
@@ -1891,30 +1908,23 @@ def search_leju_communities(keyword: str, city_code: str = "", building_type: in
 
 def _pick_leju_candidate(candidates: list[dict], want: dict, community_name: str) -> Optional[dict]:
     """先要求同縣市同行政區，再看社區名相似度，避免抓到同名的外區社區。"""
-    target_name = _leju_norm(community_name)
+    ranked = _rank_leju_candidates(candidates, want, community_name)
+    return ranked[0] if ranked else None
+
+
+def _rank_leju_candidates(candidates: list[dict], want: dict, community_name: str) -> list[dict]:
     scored = []
     for item in candidates:
-        if want["city"] and item["city"] and _leju_norm(item["city"]) != _leju_norm(want["city"]):
+        if want.get("city") and item.get("city") and _leju_norm(item["city"]) != _leju_norm(want["city"]):
             continue
-        if want["district"] and item["district"] and _leju_norm(item["district"]) != _leju_norm(want["district"]):
+        if want.get("district") and item.get("district") and _leju_norm(item["district"]) != _leju_norm(want["district"]):
             continue
-        item_name = _leju_norm(item["name"])
-        if target_name and item_name:
-            if item_name == target_name:
-                score = 3
-            elif _leju_names_compatible(target_name, item_name):
-                score = 2
-            else:
-                continue
-        elif not target_name:
-            score = 1
-        else:
+        score = _leju_name_score(community_name, item.get("name") or "")
+        if not score:
             continue
         scored.append((score, item))
-    if not scored:
-        return None
     scored.sort(key=lambda pair: pair[0], reverse=True)
-    return scored[0][1]
+    return [item for _score, item in scored]
 
 
 _LEJU_COMMUNITY_CACHE: dict = {}
@@ -1928,36 +1938,51 @@ def fetch_leju_community(community_name: str, community_address: str, listing_ad
         return _LEJU_COMMUNITY_CACHE[cache_key]
 
     keywords = [k for k in (community_name, want["road"]) if k]
-    candidate = None
+    ranked: list[dict] = []
+    seen: set[str] = set()
     for keyword in keywords:
-        candidate = _pick_leju_candidate(
+        for item in _rank_leju_candidates(
             search_leju_communities(keyword, city_code), want, community_name
-        )
-        if candidate:
-            break
+        ):
+            cid = item.get("id") or ""
+            if not cid or cid in seen:
+                continue
+            seen.add(cid)
+            ranked.append(item)
 
     result: dict = {}
-    if candidate:
+    for candidate in ranked:
         try:
             html = _fetch_leju_html(f"https://www.leju.com.tw/community/{candidate['id']}")
             parsed = parse_leju_community_html(html, candidate["id"])
+            parsed["address"] = _leju_full_address(parsed.get("address", ""), candidate)
             if _leju_result_matches(parsed, candidate, want, community_name):
-                parsed["address"] = _leju_full_address(parsed.get("address", ""), candidate)
                 result = parsed
+                break
         except Exception:
-            result = {}
+            continue
 
     _LEJU_COMMUNITY_CACHE[cache_key] = result
     return result
 
 
 def _leju_result_matches(parsed: dict, candidate: dict, want: dict, community_name: str) -> bool:
-    """社區名一致就採用；雙方都有名稱卻對不上時，不因同一條路就硬配。"""
+    """全名或一期後綴可直接用；刊登簡稱（觀湖→民權觀湖）要同一條路才接受。"""
     parsed_name = _leju_norm(parsed.get("name", ""))
     target_name = _leju_norm(community_name)
+    addr = _clean(parsed.get("address", "") or candidate.get("name") or "")
     if parsed_name and target_name:
-        return _leju_names_compatible(community_name, parsed.get("name", ""))
-    if want["road"] and want["road"] in _clean(parsed.get("address", "")):
+        if _leju_names_compatible(community_name, parsed.get("name", "")):
+            return True
+        if (
+            parsed_name.endswith(target_name)
+            and len(parsed_name) - len(target_name) >= 2
+            and want.get("road")
+            and want["road"] in addr
+        ):
+            return True
+        return False
+    if want.get("road") and want["road"] in addr:
         return True
     return False
 
@@ -2408,6 +2433,12 @@ def _fetch_page(url: str, referer: str = "") -> str:
         return response.read().decode("utf-8", "ignore")
 
 
+def _rakuya_page_ready(html: str) -> bool:
+    """物件頁有 itemInfo；社區頁是 apiCommunityInfoData，不能共用同一個檢查。"""
+    text = html or ""
+    return "window.itemInfo" in text or "window.apiCommunityInfoData" in text
+
+
 def _google_translate_proxy_url(url: str) -> str:
     """把樂屋網址轉成 translate.goog，讓 Google 代抓，避開 Cloudflare。"""
     parsed = urlparse(url)
@@ -2436,13 +2467,16 @@ def _fetch_rakuya_html(url: str) -> str:
     last_error = ""
     try:
         html = _fetch_page(_google_translate_proxy_url(url), "https://translate.google.com/")
-        if "window.itemInfo" in html:
+        if _rakuya_page_ready(html):
             return html
-        last_error = "中轉頁沒有物件資料"
+        last_error = "中轉頁沒有物件或社區資料"
     except Exception as extra:
         last_error = str(extra)
     try:
-        return _fetch_impersonated(url, must_contain="window.itemInfo")
+        html = _fetch_impersonated(url)
+        if _rakuya_page_ready(html):
+            return html
+        last_error = "頁面沒有物件或社區資料"
     except ValueError as extra:
         last_error = str(extra)
     raise ValueError(
@@ -2951,10 +2985,22 @@ def _rakuya_ehid(url: str) -> str:
     return match.group(1) if match else ""
 
 
+def _rakuya_community_url(url: str, listing: PortalListing, info: dict) -> str:
+    title = info.get("title") if isinstance(info, dict) else {}
+    for candidate in (
+        listing.community_url,
+        _clean((title or {}).get("communityUrl") or ""),
+    ):
+        if candidate and "rakuya.com.tw" in candidate:
+            return candidate.split("?")[0].rstrip("/")
+    match = re.search(r"community\.rakuya\.com\.tw/(\d+)", url or "", re.I)
+    if match:
+        return f"https://community.rakuya.com.tw/{match.group(1)}"
+    return ""
+
+
 def _fill_listing_from_group_id(listing: PortalListing, group_id: str) -> None:
-    """樂屋常轉貼信義／永慶物件；來源頁可補樓層等缺漏欄位。"""
-    if listing.floor and listing.community_name and not listing.parking_unknown:
-        return
+    """樂屋常轉貼信義／永慶物件；來源頁可補樓層、門牌與座標。"""
     group_id = _clean(group_id or "")
     if "/" not in group_id:
         return
@@ -2975,9 +3021,18 @@ def _fill_listing_from_group_id(listing: PortalListing, group_id: str) -> None:
         return
     if not listing.floor:
         listing.floor = other.floor
-    if not listing.community_name:
+    if other.community_name and (
+        not listing.community_name
+        or (
+            _leju_name_score(listing.community_name, other.community_name) >= 1
+            and len(_leju_norm(other.community_name)) > len(_leju_norm(listing.community_name))
+        )
+    ):
         listing.community_name = other.community_name
-    if not listing.listing_address:
+    if other.listing_address and (
+        not listing.listing_address
+        or ("號" in other.listing_address and "號" not in (listing.listing_address or ""))
+    ):
         listing.listing_address = other.listing_address
     if listing.parking_unknown and not other.parking_unknown:
         listing.parking_desc = other.parking_desc
@@ -3024,7 +3079,7 @@ def analyze_rakuya(url: str) -> AnalysisReport:
         )
     listing = parse_rakuya_html(html, page_url)
     info = _extract_js_object(html, "window.itemInfo")
-    community_url = listing.community_url or _clean((info.get("title") or {}).get("communityUrl") or "")
+    community_url = _rakuya_community_url(url, listing, info)
     if community_url:
         try:
             apply_rakuya_community(listing, _fetch_rakuya_html(community_url))
@@ -3417,29 +3472,10 @@ def analyze_etwarm(url: str) -> AnalysisReport:
 
 
 def analyze_portal_listing(listing: PortalListing) -> AnalysisReport:
-    """信義／永慶／樂屋物件共用：社區補樂居、行情走實價登錄。"""
+    """信義／永慶／樂屋物件共用：先補樂居社區，再依完整地址查捷運超市與行情。"""
     sources = [f"{listing.source_name}物件頁：{listing.source_url}"]
     listing_address = listing.listing_address or UNKNOWN
     community_address = listing_address if listing_address != UNKNOWN else ""
-
-    api_key = _google_maps_api_key()
-    nearby_lat, nearby_lon = listing.lat, listing.lon
-    if (not nearby_lat or not nearby_lon) and community_address:
-        if api_key:
-            nearby_lat, nearby_lon = geocode_google(community_address, api_key)
-        if not nearby_lat or not nearby_lon:
-            nearby_lat, nearby_lon = geocode_nominatim(community_address)
-    nearest_mrt = _or_unknown(listing.nearest_mrt)
-    nearest_shop = _or_unknown(listing.nearest_shop)
-    if nearby_lat and nearby_lon and (nearest_mrt == UNKNOWN or nearest_shop == UNKNOWN):
-        osm_mrt, osm_shop = fetch_nearby_cached(nearby_lat, nearby_lon, api_key=api_key)
-        if nearest_mrt == UNKNOWN:
-            nearest_mrt = osm_mrt
-        if nearest_shop == UNKNOWN:
-            nearest_shop = osm_shop
-        sources.append("Google Maps 周邊設施（步行距離）" if api_key else "OpenStreetMap 周邊設施")
-    elif listing.nearest_mrt or listing.nearest_shop:
-        sources.append(f"{listing.source_name}社區周邊")
 
     registered = listing.registered
     main_area = listing.main_area
@@ -3463,7 +3499,7 @@ def analyze_portal_listing(listing: PortalListing) -> AnalysisReport:
             building_floors = f"{match.group(1)}樓"
 
     leju = {}
-    if listing.community_name:
+    if listing.community_name or community_address:
         leju = fetch_leju_community(listing.community_name, community_address, listing_address)
     fields_591 = {
         "community_name": listing.community_name,
@@ -3476,6 +3512,28 @@ def analyze_portal_listing(listing: PortalListing) -> AnalysisReport:
     report_fields = merge_community_fields(fields_591, leju, sources)
     if parking_bundled:
         report_fields["public_ratio"] = _annotate_public_ratio(report_fields["public_ratio"], True)
+
+    api_key = _google_maps_api_key()
+    nearby_lat, nearby_lon = listing.lat, listing.lon
+    geo_address = report_fields.get("community_address") or community_address
+    if geo_address == UNKNOWN:
+        geo_address = community_address
+    if (not nearby_lat or not nearby_lon) and geo_address and geo_address != UNKNOWN:
+        if api_key:
+            nearby_lat, nearby_lon = geocode_google(geo_address, api_key)
+        if not nearby_lat or not nearby_lon:
+            nearby_lat, nearby_lon = geocode_nominatim(geo_address)
+    nearest_mrt = _or_unknown(listing.nearest_mrt)
+    nearest_shop = _or_unknown(listing.nearest_shop)
+    if nearby_lat and nearby_lon and (nearest_mrt == UNKNOWN or nearest_shop == UNKNOWN):
+        osm_mrt, osm_shop = fetch_nearby_cached(nearby_lat, nearby_lon, api_key=api_key)
+        if nearest_mrt == UNKNOWN:
+            nearest_mrt = osm_mrt
+        if nearest_shop == UNKNOWN:
+            nearest_shop = osm_shop
+        sources.append("Google Maps 周邊設施（步行距離）" if api_key else "OpenStreetMap 周邊設施")
+    elif listing.nearest_mrt or listing.nearest_shop:
+        sources.append(f"{listing.source_name}社區周邊")
 
     want = _split_tw_address(report_fields["community_address"], community_address, listing_address)
     door_numbers, listing_addrs = _plvr_address_inputs(

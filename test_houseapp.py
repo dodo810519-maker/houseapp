@@ -20,13 +20,17 @@ from scraper import (
     _parse_twhg_id,
     _parse_yungching_id,
     _leju_names_compatible,
+    _leju_name_score,
+    _leju_result_matches,
     _pick_leju_candidate,
     _plvr_parking_keywords,
     _price_to_wan,
     _split_tw_address,
     apply_rakuya_community,
     _google_translate_proxy_url,
+    _rakuya_community_url,
     _rakuya_ehid,
+    _rakuya_page_ready,
     merge_community_fields,
     parse_cthouse_listing,
     parse_etwarm_html,
@@ -37,6 +41,7 @@ from scraper import (
     parse_sinyi_html,
     parse_twhg_html,
     parse_yungching_html,
+    PortalListing,
 )
 
 
@@ -325,6 +330,20 @@ class UrlParseTests(unittest.TestCase):
         self.assertIn("www-rakuya-com-tw.translate.goog", url)
         self.assertIn("ehid=0b0136347737533", url)
         self.assertIn("_x_tr_pto=wapp", url)
+
+    def test_rakuya_community_page_counts_as_ready(self):
+        self.assertTrue(_rakuya_page_ready('window.apiCommunityInfoData = {"data":{}}'))
+        self.assertTrue(_rakuya_page_ready("window.itemInfo = {}"))
+        self.assertFalse(_rakuya_page_ready("<html>Just a moment</html>"))
+        listing = PortalListing(source_name="樂屋網", listing_id="x", source_url="https://www.rakuya.com.tw/")
+        self.assertEqual(
+            _rakuya_community_url(
+                "https://community.rakuya.com.tw/38039/sell/info?ehid=0b0136347737533",
+                listing,
+                {},
+            ),
+            "https://community.rakuya.com.tw/38039",
+        )
 
 
 class MergeCommunityTests(unittest.TestCase):
@@ -619,6 +638,7 @@ class CommunityMatchTests(unittest.TestCase):
 
     def test_leju_does_not_treat_similar_community_as_same(self):
         self.assertFalse(_leju_names_compatible("觀湖", "民權觀湖"))
+        self.assertEqual(_leju_name_score("觀湖", "民權觀湖"), 1)
         self.assertTrue(_leju_names_compatible("觀湖", "觀湖"))
         self.assertTrue(_leju_names_compatible("觀湖", "觀湖一期"))
         candidates = [
@@ -633,7 +653,23 @@ class CommunityMatchTests(unittest.TestCase):
             want,
             "觀湖",
         )
-        self.assertIsNone(picked)
+        self.assertEqual(picked["id"], "L1")
+        self.assertTrue(
+            _leju_result_matches(
+                {"name": "民權觀湖", "address": "康寧路三段54-5號"},
+                {"id": "L1", "name": "民權觀湖"},
+                want,
+                "觀湖",
+            )
+        )
+        self.assertFalse(
+            _leju_result_matches(
+                {"name": "民權觀湖", "address": "民權東路六段"},
+                {"id": "L1", "name": "民權觀湖"},
+                want,
+                "觀湖",
+            )
+        )
 
 
 if __name__ == "__main__":
