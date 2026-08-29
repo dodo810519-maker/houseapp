@@ -16,6 +16,7 @@ from typing import Optional
 from urllib.parse import urlparse
 
 import plvr
+import mrt_stations
 
 try:
     from PIL import Image
@@ -29,7 +30,10 @@ UNDETERMINED = "無法判斷"
 NEARBY_CACHE_PATH = Path(__file__).with_name("nearby_cache.json")
 
 CONVENIENCE_NAMES = ("全家", "7-eleven", "7-eleven", "7-11", "統一超商", "ok超商", "ok mart", "萊爾富", "hi-life")
-SUPERMARKET_HINTS = ("全聯", "美廉社", "家樂福", "大潤發", "愛買", "頂好", "松青", "jasons", "costco", "好市多", "超市", "主婦聯盟", "pxmart", "px mart")
+SUPERMARKET_HINTS = (
+    "全聯", "美廉社", "家樂福", "carrefour", "大潤發", "愛買", "頂好", "松青",
+    "jasons", "costco", "好市多", "超市", "主婦聯盟", "pxmart", "px mart",
+)
 
 
 @dataclass
@@ -746,21 +750,30 @@ def parse_community_deals(html: str) -> list[Deal]:
 
 def _query_overpass(query: str, timeout: int = 12) -> Optional[dict]:
     encoded = urllib.parse.quote(query)
-    try:
-        req = urllib.request.Request(
-            "https://overpass-api.de/api/interpreter",
-            data=f"data={encoded}".encode("utf-8"),
-            method="POST",
-            headers={
-                "User-Agent": "houseapp/1.0 (591 property analysis)",
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Accept": "*/*",
-            },
-        )
-        with urllib.request.urlopen(req, timeout=timeout, context=_ssl_context()) as response:
-            return json.loads(response.read().decode("utf-8", "ignore"))
-    except Exception:
-        return None
+    body = f"data={encoded}".encode("utf-8")
+    headers = {
+        "User-Agent": "houseapp/1.0 (property analysis)",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "*/*",
+    }
+    for endpoint in (
+        "https://overpass-api.de/api/interpreter",
+        "https://overpass.kumi.systems/api/interpreter",
+    ):
+        try:
+            req = urllib.request.Request(endpoint, data=body, method="POST", headers=headers)
+            with urllib.request.urlopen(req, timeout=timeout, context=_ssl_context()) as response:
+                return json.loads(response.read().decode("utf-8", "ignore"))
+        except Exception:
+            continue
+    return None
+
+
+def _osm_latlon(el: dict) -> tuple[Optional[float], Optional[float]]:
+    if "lat" in el and "lon" in el:
+        return _to_float(el.get("lat")), _to_float(el.get("lon"))
+    center = el.get("center") or {}
+    return _to_float(center.get("lat")), _to_float(center.get("lon"))
 
 
 def _load_nearby_cache() -> dict:
@@ -786,7 +799,7 @@ def fetch_nearby_cached(
     api_key: str = "",
 ) -> tuple[str, str]:
     api_key = api_key or _google_maps_api_key()
-    cache_key = f"google:{lat:.4f},{lon:.4f}" if api_key else f"osm:{lat:.3f},{lon:.3f}"
+    cache_key = f"v2:{lat:.4f},{lon:.4f}:{1 if api_key else 0}"
     cache = _load_nearby_cache()
     cached = cache.get(cache_key)
     if isinstance(cached, list) and len(cached) == 2:
@@ -795,8 +808,16 @@ def fetch_nearby_cached(
     mrt, shop = UNKNOWN, UNKNOWN
     if api_key:
         mrt, shop = fetch_nearby_google(lat, lon, api_key, timeout=timeout)
-    if mrt == UNKNOWN and shop == UNKNOWN:
-        mrt, shop = fetch_nearby(lat, lon, timeout=timeout)
+    if mrt == UNKNOWN:
+        mrt = nearest_mrt_from_table(lat, lon)
+    if shop == UNKNOWN:
+        shop = nearest_supermarket_nominatim(lat, lon)
+    if mrt == UNKNOWN or shop == UNKNOWN:
+        osm_mrt, osm_shop = fetch_nearby(lat, lon, timeout=min(timeout, 8))
+        if mrt == UNKNOWN:
+            mrt = osm_mrt
+        if shop == UNKNOWN:
+            shop = osm_shop
 
     if mrt != UNKNOWN or shop != UNKNOWN:
         cache[cache_key] = [mrt, shop]
@@ -804,14 +825,75 @@ def fetch_nearby_cached(
     return mrt, shop
 
 
+def nearest_mrt_from_table(lat: float, lon: float, max_meters: int = 2500) -> str:
+    best: Optional[tuple[int, str]] = None
+    for name, slat, slon in mrt_stations.STATIONS:
+        meters = _haversine_m(lat, lon, slat, slon)
+        if meters <= max_meters and (best is None or meters < best[0]):
+            best = (meters, name)
+    if not best:
+        return UNKNOWN
+    label = best[1]
+    if "捷運" not in label:
+        label = f"{label}捷運站" if not label.endswith("站") else f"捷運{label}"
+    return f"{label}，{_walk_text(best[0])}"
+
+
+def _nominatim_viewbox_search(
+    query: str, lat: float, lon: float, timeout: int = 12, span: float = 0.02
+) -> list[tuple[str, float, float]]:
+    url = (
+        "https://nominatim.openstreetmap.org/search?"
+        + urllib.parse.urlencode(
+            {
+                "q": query,
+                "format": "json",
+                "limit": 8,
+                "countrycodes": "tw",
+                "viewbox": f"{lon - span},{lat + span},{lon + span},{lat - span}",
+                "bounded": 1,
+            }
+        )
+    )
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "houseapp/1.0"})
+        with urllib.request.urlopen(req, timeout=timeout, context=_ssl_context()) as response:
+            data = json.loads(response.read().decode("utf-8", "ignore"))
+    except Exception:
+        return []
+    results = []
+    for item in data or []:
+        name = _clean((item.get("display_name") or "").split(",")[0])
+        plat, plon = _to_float(item.get("lat")), _to_float(item.get("lon"))
+        if name and plat is not None and plon is not None:
+            results.append((name, plat, plon))
+    return results
+
+
+def nearest_supermarket_nominatim(lat: float, lon: float, max_meters: int = 1500) -> str:
+    best: Optional[tuple[int, str]] = None
+    for query in ("全聯", "家樂福", "美廉社", "大潤發"):
+        for name, plat, plon in _nominatim_viewbox_search(query, lat, lon):
+            blob = name.lower()
+            if any(x in blob for x in CONVENIENCE_NAMES):
+                continue
+            meters = _haversine_m(lat, lon, plat, plon)
+            if meters <= max_meters and (best is None or meters < best[0]):
+                best = (meters, name)
+        if best and best[0] <= 400:
+            break
+    if not best:
+        return UNKNOWN
+    return f"{best[1]}，{_walk_text(best[0])}"
+
+
 def fetch_nearby(lat: float, lon: float, timeout: int = 12) -> tuple[str, str]:
     query = (
-        f"[out:json][timeout:25];("
-        f'node["station"="subway"](around:2500,{lat},{lon});'
-        f'node["railway"="station"]["station"="subway"](around:2500,{lat},{lon});'
-        f'node["public_transport"="station"]["subway"="yes"](around:2500,{lat},{lon});'
-        f'node["shop"="supermarket"](around:1500,{lat},{lon});'
-        f");out;"
+        f"[out:json][timeout:20];("
+        f'nwr["station"="subway"](around:2500,{lat},{lon});'
+        f'nwr["railway"="subway_entrance"](around:2500,{lat},{lon});'
+        f'nwr["shop"="supermarket"](around:1500,{lat},{lon});'
+        f");out center;"
     )
     data = _query_overpass(query, timeout=timeout)
     if not data:
@@ -825,22 +907,26 @@ def fetch_nearby(lat: float, lon: float, timeout: int = 12) -> tuple[str, str]:
     for el in data.get("elements", []):
         tags = el.get("tags", {})
         name = tags.get("name") or tags.get("name:zh") or tags.get("brand") or ""
-        if not name or "lat" not in el or "lon" not in el:
+        plat, plon = _osm_latlon(el)
+        if not name or plat is None or plon is None:
             continue
-        meters = _haversine_m(lat, lon, float(el["lat"]), float(el["lon"]))
-        is_subway = tags.get("station") == "subway" or tags.get("subway") == "yes"
+        meters = _haversine_m(lat, lon, plat, plon)
+        is_subway = (
+            tags.get("station") == "subway"
+            or tags.get("subway") == "yes"
+            or tags.get("railway") == "subway_entrance"
+        )
         shop_type = tags.get("shop")
         lower = name.lower()
 
         if is_subway:
-            key = name.replace("站", "")
+            key = name.replace("站", "").replace("捷運", "")
             if key not in seen_mrt:
                 seen_mrt.add(key)
-                mrt.append(NearbyPlace(name=f"{key}捷運站", meters=meters))
+                label = name if "捷運" in name or name.endswith("站") else f"{key}捷運站"
+                mrt.append(NearbyPlace(name=label, meters=meters))
         elif shop_type == "supermarket":
             if any(x in lower for x in CONVENIENCE_NAMES):
-                continue
-            if "spa" in lower:
                 continue
             is_named = any(x in lower or x in name for x in SUPERMARKET_HINTS)
             if not is_named:

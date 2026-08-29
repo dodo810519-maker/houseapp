@@ -32,6 +32,7 @@ from scraper import (
     _rakuya_ehid,
     _rakuya_page_ready,
     merge_community_fields,
+    nearest_mrt_from_table,
     parse_cthouse_listing,
     parse_etwarm_html,
     parse_hbhousing_html,
@@ -330,6 +331,13 @@ class UrlParseTests(unittest.TestCase):
         self.assertIn("www-rakuya-com-tw.translate.goog", url)
         self.assertIn("ehid=0b0136347737533", url)
         self.assertIn("_x_tr_pto=wapp", url)
+
+
+class NearbyLookupTests(unittest.TestCase):
+    def test_neihu_listing_finds_huzhou_mrt(self):
+        text = nearest_mrt_from_table(25.07142, 121.60941)
+        self.assertIn("葫洲", text)
+        self.assertNotEqual(text, "查無資料")
 
     def test_rakuya_community_page_counts_as_ready(self):
         self.assertTrue(_rakuya_page_ready('window.apiCommunityInfoData = {"data":{}}'))
