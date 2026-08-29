@@ -69,7 +69,8 @@ class LandDeal:
 
 
 def normalize_address(text: str) -> str:
-    return (text or "").translate(_FULLWIDTH_DIGITS).replace("臺", "台").replace(" ", "")
+    text = (text or "").translate(_FULLWIDTH_DIGITS).replace("臺", "台").replace(" ", "")
+    return text.replace("－", "-").replace("–", "-")
 
 
 def _to_float(value: str) -> float:
@@ -91,17 +92,20 @@ def _roc_year(value: str) -> Optional[int]:
 def _floor_to_int(text: str) -> Optional[int]:
     """把實價登錄的「移轉層次」轉成樓層數字。地下為負、全層／多層一次移轉回傳 None。"""
     text = (text or "").translate(_FULLWIDTH_DIGITS)
-    if re.search(r"全層|見其他|見使用|整棟", text):
+    if re.search(r"全層|見使用|整棟", text):
         return None
-    if "，" in text or "," in text:
-        return None  # 「一層，二層，三層」是整棟或透天，不能當單層戶
+    # 「一層，二層」是一次移轉多層；「七層，電梯樓梯間」仍是單層，不能看到逗號就整筆丟掉。
+    layer_tokens = re.findall(r"[一二三四五六七八九十百]+\s*層|\d+\s*層", text)
+    if len(layer_tokens) >= 2:
+        return None
 
     underground = bool(re.search(r"地下|B\s*\d", text, re.I))
-    chinese = _chinese_floor(text)
+    token = layer_tokens[0] if layer_tokens else text
+    chinese = _chinese_floor(token)
     if chinese is not None:
         return -chinese if underground else chinese
 
-    match = re.search(r"(\d+)", text)
+    match = re.search(r"(\d+)", token)
     if match:
         value = int(match.group(1))
         return -value if underground else value
@@ -297,14 +301,62 @@ def load_city_deals(city: str, seasons: Optional[list[str]] = None) -> tuple[lis
 
 def building_key(address: str) -> str:
     """取到門牌號為止，例如「台北市南港區經貿一路59號五樓」→「…經貿一路59號」。"""
-    text = normalize_address(address)
-    match = re.match(r"^(.*?\d+號)", text)
+    text = _normalize_subno(normalize_address(address))
+    match = re.match(r"^(.*?\d+(?:之\d+)?號)", text)
     return match.group(1) if match else text
 
 
+def _normalize_subno(text: str) -> str:
+    """刊登常用 54-5號，實價登錄是 54之5號。"""
+    return re.sub(r"(\d+)-(\d+)號", r"\1之\2號", text)
+
+
+def parse_house_number(address: str) -> tuple[Optional[int], Optional[int], Optional[int], Optional[int]]:
+    """拆門牌為 (巷, 弄, 號, 之號)。54-5號／54之5號 → (None, None, 54, 5)。"""
+    text = _normalize_subno(normalize_address(address))
+    match = re.search(r"(?:(\d+)巷)?(?:(\d+)弄)?(\d+)(?:之(\d+))?號", text)
+    if not match:
+        return None, None, None, None
+    lane = int(match.group(1)) if match.group(1) else None
+    alley = int(match.group(2)) if match.group(2) else None
+    door = int(match.group(3)) if match.group(3) else None
+    sub = int(match.group(4)) if match.group(4) else None
+    return lane, alley, door, sub
+
+
 def door_number(address: str) -> Optional[int]:
-    match = re.search(r"(\d+)號", normalize_address(address))
-    return int(match.group(1)) if match else None
+    """主門牌號。54之5號、54-5號都回 54，不會誤取之號的 5。"""
+    _lane, _alley, door, _sub = parse_house_number(address)
+    return door
+
+
+def _same_building_cluster(deal_address: str, listing_addresses: list[str]) -> bool:
+    """同社區門牌：54號／54之5號算同一組；189巷54號、54巷透天則不算。"""
+    d_lane, d_alley, d_door, _d_sub = parse_house_number(deal_address)
+    if d_door is None:
+        return False
+    for raw in listing_addresses:
+        l_lane, l_alley, l_door, _l_sub = parse_house_number(raw)
+        if l_door is None and l_lane is None:
+            continue
+        if l_lane is not None:
+            if d_lane == l_lane and (l_alley is None or d_alley == l_alley):
+                if l_door is None or d_door == l_door:
+                    return True
+            continue
+        if l_door is None:
+            continue
+        if d_lane is None and d_door == l_door:
+            return True
+        if d_lane == l_door and (l_alley is None or d_alley == l_alley):
+            return True
+    return False
+
+
+def _compatible_total_floor(deal_floor: Optional[int], total_floor: Optional[int]) -> bool:
+    if not total_floor or not deal_floor:
+        return True
+    return abs(deal_floor - total_floor) <= 3
 
 
 def find_building_deals(
@@ -313,11 +365,13 @@ def find_building_deals(
     road: str,
     numbers: set[int],
     total_floor: Optional[int] = None,
+    addresses: Optional[list[str]] = None,
 ) -> tuple[list[LandDeal], str]:
-    """框出「同一棟」的成交。
+    """框出「同一棟／同一社區門牌」的成交。
 
-    一個社區常橫跨數個門牌（例如 55、57、59 號），591 與樂居又可能各記其中一個，
-    所以門牌完全相同時直接採用，否則退而求其次用同路段＋相鄰門牌＋同樓高界定。
+    一個社區常橫跨 54號、54之5號、54巷；但不能把「康寧路三段189巷54號」
+    當成「康寧路三段54號」。沒找到同社區門牌時，才用同路段、無巷弄、相鄰門牌。
+    不再用「整條路同樓高」當同棟，那會把便宜很多的別社區算進來。
     """
     district = normalize_address(district)
     road = normalize_address(road)
@@ -328,25 +382,32 @@ def find_building_deals(
     if not pool:
         return [], ""
 
-    exact = [d for d in pool if door_number(d.address) in numbers]
-    if exact:
-        return exact, "同門牌"
+    listing_addrs = [a for a in (addresses or []) if a]
+    cluster = [d for d in pool if listing_addrs and _same_building_cluster(d.address, listing_addrs)]
+    if not cluster and numbers:
+        cluster = [
+            d
+            for d in pool
+            if parse_house_number(d.address)[0] is None and door_number(d.address) in numbers
+        ]
+    if cluster:
+        floored = [d for d in cluster if _compatible_total_floor(d.total_floor, total_floor)]
+        if floored:
+            return floored, "同社區門牌"
+        if not total_floor:
+            return cluster, "同社區門牌"
 
     if total_floor and numbers:
         near = [
             d
             for d in pool
             if d.total_floor == total_floor
-            and (door_number(d.address) or -999) != -999
-            and any(abs(door_number(d.address) - n) <= 10 for n in numbers)
+            and parse_house_number(d.address)[0] is None
+            and door_number(d.address) is not None
+            and any(abs((door_number(d.address) or 0) - n) <= 10 for n in numbers)
         ]
         if near:
             return near, f"同路段相鄰門牌且同為 {total_floor} 層"
-
-    if total_floor:
-        same_floor = [d for d in pool if d.total_floor == total_floor]
-        if same_floor:
-            return same_floor, f"同路段且同為 {total_floor} 層"
     return [], ""
 
 
@@ -370,7 +431,7 @@ def find_comparables(
     def usable(items: list[LandDeal]) -> int:
         return len(usable_unit_prices(items))
 
-    if usable(building_deals) >= 5:
+    if usable(building_deals) >= 1:
         return building_deals, "同棟成交"
 
     conditions = []
@@ -431,7 +492,11 @@ def unit_price_quartiles(deals: list[LandDeal]) -> tuple[Optional[float], Option
     values = usable_unit_prices(deals)
     if not values:
         return None, None, None, 0
-    if len(values) < 4:
+    if len(values) == 1:
+        value = values[0]
+        return round(value * 0.95, 2), round(value, 1), round(value * 1.05, 2), 1
+    # 同棟只有幾筆時，四分位會把最新高價裁掉，看起來像估太低。
+    if len(values) < 8:
         return values[0], round(statistics.median(values), 1), values[-1], len(values)
     return (
         values[len(values) // 4],

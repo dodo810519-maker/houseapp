@@ -1472,6 +1472,7 @@ def estimate_market_from_plvr(
     floor_text: str,
     sources: list[str],
     parking_bundled: bool = False,
+    listing_addresses: Optional[list[str]] = None,
 ) -> MarketEstimate:
     """以內政部實價登錄推估行情。估不出來時 unit_price_range 為 None，交由 591 的估算接手。"""
     if not want.get("city"):
@@ -1484,15 +1485,34 @@ def estimate_market_from_plvr(
     if not deals:
         return MarketEstimate()
 
-    total_floor = _first_int(building_floors)
+    total_floor = _first_int(floor_text.split("/")[-1] if "/" in (floor_text or "") else building_floors)
     age = _first_int(house_age)
     build_year = None
     if age is not None:
         build_year = (date.today().year - 1911) - age
 
+    addresses = [a for a in (listing_addresses or [want.get("text", "")]) if a]
     building_deals, building_scope = plvr.find_building_deals(
-        deals, want.get("district", ""), want.get("road", ""), door_numbers, total_floor
+        deals,
+        want.get("district", ""),
+        want.get("road", ""),
+        door_numbers,
+        total_floor,
+        addresses=addresses,
     )
+    if len(plvr.usable_unit_prices(building_deals)) < 3:
+        extra_deals, extra_seasons = plvr.load_city_deals(want["city"], plvr.recent_seasons(12))
+        extra_building, extra_scope = plvr.find_building_deals(
+            extra_deals,
+            want.get("district", ""),
+            want.get("road", ""),
+            door_numbers,
+            total_floor,
+            addresses=addresses,
+        )
+        if len(plvr.usable_unit_prices(extra_building)) > len(plvr.usable_unit_prices(building_deals)):
+            deals, seasons = extra_deals, extra_seasons
+            building_deals, building_scope = extra_building, extra_scope
     if building_deals:
         sources.append(f"實價登錄同棟成交 {len(building_deals)} 筆（比對方式：{building_scope}）")
 
@@ -1811,14 +1831,20 @@ def _split_tw_address(*addresses: str) -> dict:
         district = match.group(0)
     tail = text.split(district, 1)[1] if district and district in text else text
     road_match = _LEJU_ROAD_RE.search(tail)
-    number = re.search(r"(\d+)\s*號", tail)
+    _lane, _alley, door, _sub = plvr.parse_house_number(tail)
     return {
         "text": text,
         "city": city,
         "district": district,
         "road": road_match.group(1) if road_match else "",
-        "number": number.group(1) if number else "",
+        "number": str(door) if door else "",
     }
+
+
+def _plvr_address_inputs(*addresses: str) -> tuple[set[int], list[str]]:
+    cleaned = [_clean(a) for a in addresses if a and a != UNKNOWN]
+    numbers = {n for addr in cleaned for n in [plvr.door_number(addr)] if n}
+    return numbers, cleaned
 
 
 def _leju_api_json(path: str, params: dict) -> dict:
@@ -2148,18 +2174,12 @@ def analyze_591(url: str) -> AnalysisReport:
         )
 
     want = _split_tw_address(report_fields["community_address"], community_address, listing_address)
-    door_numbers = {
-        number
-        for addr in (
-            report_fields["community_address"],
-            community_address,
-            listing_address,
-            leju.get("address", ""),
-        )
-        if addr and addr != UNKNOWN
-        for number in [plvr.door_number(addr)]
-        if number
-    }
+    door_numbers, listing_addrs = _plvr_address_inputs(
+        report_fields["community_address"],
+        community_address,
+        listing_address,
+        leju.get("address", ""),
+    )
 
     market = estimate_market_from_plvr(
         want,
@@ -2172,6 +2192,7 @@ def analyze_591(url: str) -> AnalysisReport:
         floor_text,
         sources,
         parking_bundled=parking_bundled,
+        listing_addresses=listing_addrs,
     )
     unit_range, total_range, comment = market.unit_price_range, market.total_price_range, market.comment
     previous_sale = market.previous_sale
@@ -2286,7 +2307,9 @@ def analyze_leju_community_url(url: str) -> AnalysisReport:
         sources,
     )
     want = _split_tw_address(report_fields["community_address"], leju.get("address", ""))
-    door_numbers = {n for n in [plvr.door_number(leju.get("address", ""))] if n}
+    door_numbers, listing_addrs = _plvr_address_inputs(
+        report_fields["community_address"], leju.get("address", "")
+    )
     market = estimate_market_from_plvr(
         want,
         door_numbers,
@@ -2297,6 +2320,7 @@ def analyze_leju_community_url(url: str) -> AnalysisReport:
         "",
         "",
         sources,
+        listing_addresses=listing_addrs,
     )
     return AnalysisReport(
         title=report_fields["community_name"],
@@ -3454,13 +3478,12 @@ def analyze_portal_listing(listing: PortalListing) -> AnalysisReport:
         report_fields["public_ratio"] = _annotate_public_ratio(report_fields["public_ratio"], True)
 
     want = _split_tw_address(report_fields["community_address"], community_address, listing_address)
-    door_numbers = {
-        number
-        for addr in (report_fields["community_address"], community_address, listing_address, leju.get("address", ""))
-        if addr and addr != UNKNOWN
-        for number in [plvr.door_number(addr)]
-        if number
-    }
+    door_numbers, listing_addrs = _plvr_address_inputs(
+        report_fields["community_address"],
+        community_address,
+        listing_address,
+        leju.get("address", ""),
+    )
     registered_ping = _to_float(registered)
     market = estimate_market_from_plvr(
         want,
@@ -3473,6 +3496,7 @@ def analyze_portal_listing(listing: PortalListing) -> AnalysisReport:
         floor_text,
         sources,
         parking_bundled=parking_bundled,
+        listing_addresses=listing_addrs,
     )
     unit_range, total_range, comment = market.unit_price_range, market.total_price_range, market.comment
     previous_sale = market.previous_sale

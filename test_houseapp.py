@@ -23,6 +23,7 @@ from scraper import (
     _pick_leju_candidate,
     _plvr_parking_keywords,
     _price_to_wan,
+    _split_tw_address,
     apply_rakuya_community,
     _google_translate_proxy_url,
     _rakuya_ehid,
@@ -69,6 +70,94 @@ class AddressTests(unittest.TestCase):
         self.assertEqual(plvr.building_key(text), "台北市南港區經貿一路59號")
         self.assertEqual(plvr.door_number(text), 59)
 
+    def test_sub_number_and_lane_are_not_the_main_door(self):
+        self.assertEqual(plvr.door_number("台北市內湖區康寧路三段54-5號"), 54)
+        self.assertEqual(plvr.door_number("台北市內湖區康寧路三段54之5號七樓"), 54)
+        self.assertEqual(plvr.parse_house_number("台北市內湖區康寧路三段54-5號"), (None, None, 54, 5))
+        self.assertEqual(plvr.parse_house_number("台北市內湖區康寧路三段54巷12號"), (54, None, 12, None))
+        self.assertEqual(plvr.parse_house_number("台北市內湖區康寧路三段189巷54號"), (189, None, 54, None))
+        self.assertEqual(
+            plvr.building_key("台北市內湖區康寧路三段54-5號七樓"),
+            "台北市內湖區康寧路三段54之5號",
+        )
+
+    def test_building_cluster_ignores_same_number_on_another_lane(self):
+        listing = ["台北市內湖區康寧路三段54-5號"]
+        self.assertTrue(plvr._same_building_cluster("台北市內湖區康寧路三段54之5號七樓", listing))
+        self.assertTrue(plvr._same_building_cluster("台北市內湖區康寧路三段54之6號", listing))
+        self.assertTrue(plvr._same_building_cluster("台北市內湖區康寧路三段54巷12號", listing))
+        self.assertFalse(plvr._same_building_cluster("台北市內湖區康寧路三段189巷54號", listing))
+
+    def test_find_building_deals_does_not_use_whole_road(self):
+        same = deal(
+            address="台北市內湖區康寧路三段54之5號七樓",
+            total_floor=13,
+            house_unit_price=97.47,
+            parking_ping=0,
+            house_ping=24.19,
+            building_type="住宅大樓(11層含以上有電梯)",
+        )
+        other_lane = deal(
+            address="台北市內湖區康寧路三段189巷54號一樓",
+            total_floor=6,
+            house_unit_price=50.17,
+            parking_ping=0,
+            house_ping=40.26,
+        )
+        cheap_same_road = deal(
+            address="台北市內湖區康寧路三段200號五樓",
+            total_floor=10,
+            house_unit_price=61.9,
+            parking_ping=0,
+            house_ping=20,
+        )
+        short = deal(
+            address="台北市內湖區康寧路三段54巷9號二樓",
+            total_floor=5,
+            house_unit_price=81.27,
+            parking_ping=0,
+            house_ping=28.3,
+        )
+        found, scope = plvr.find_building_deals(
+            [same, other_lane, cheap_same_road, short],
+            "內湖區",
+            "康寧路三段",
+            {54},
+            total_floor=10,
+            addresses=["台北市內湖區康寧路三段54-5號"],
+        )
+        self.assertEqual(found, [same])
+        self.assertEqual(scope, "同社區門牌")
+        comparables, tier = plvr.find_comparables(
+            [same, other_lane, cheap_same_road, short],
+            "內湖區",
+            found,
+            "康寧路三段",
+            total_floor=10,
+            build_year=85,
+        )
+        self.assertEqual(comparables, [same])
+        self.assertEqual(tier, "同棟成交")
+        low, mid, high, n = plvr.unit_price_quartiles(
+            [
+                deal(house_unit_price=83.21, parking_ping=0),
+                deal(house_unit_price=84.22, parking_ping=0),
+                deal(house_unit_price=85.26, parking_ping=0),
+                deal(house_unit_price=85.51, parking_ping=0),
+                deal(house_unit_price=97.47, parking_ping=0),
+            ]
+        )
+        self.assertEqual(n, 5)
+        self.assertEqual(low, 83.21)
+        self.assertEqual(high, 97.47)
+
+    def test_split_address_keeps_main_door_not_subno(self):
+        want = _split_tw_address("台北市內湖區康寧路三段54-5號")
+        self.assertEqual(want["city"], "台北市")
+        self.assertEqual(want["district"], "內湖區")
+        self.assertEqual(want["road"], "康寧路三段")
+        self.assertEqual(want["number"], "54")
+
 
 class FloorParseTests(unittest.TestCase):
     def test_listing_floor(self):
@@ -87,6 +176,7 @@ class FloorParseTests(unittest.TestCase):
         self.assertEqual(plvr._floor_to_int("地下一層"), -1)
         self.assertIsNone(plvr._floor_to_int("全層"))
         self.assertIsNone(plvr._floor_to_int("一層，二層，三層"))
+        self.assertEqual(plvr._floor_to_int("七層，電梯樓梯間"), 7)
 
 
 class PreviousSaleTests(unittest.TestCase):
